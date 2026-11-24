@@ -1,0 +1,59 @@
+# Maven build output
+/target/
+*.class
+*.jar
+
+# IDE and operating system metadata
+/.idea/
+*.iml
+/.vscode/
+/.classpath
+/.project
+/.settings/
+.DS_Store
+*.swp
+
+# Local design notes and assistant configuration
+/DESIGN.md
+[Cc][Ll][Aa][Uu][Dd][Ee].md
+[Aa][Gg][Ee][Nn][Tt][Ss].md
+[Gg][Ee][Mm][Ii][Nn][Ii].md
+.claude/
+.agents/
+.codex/
+.cursor/
+.cursorrules
+.windsurf/
+.windsurfrules
+.clinerules
+.aider*
+/.github/copilot-instructions.md
+
+# Local Burp projects, traffic and exports
+/local-data/
+*.[bB][uU][rR][pP]
+*.[bB][uU][rR][pP].*
+*.[hH][aA][rR]
+*.[hH][aA][rR].*
+*.[pP][cC][aA][pP]
+*.[pP][cC][aA][pP].*
+*.[pP][cC][aA][pP][nN][gG]
+*.[pP][cC][aA][pP][nN][gG].*
+*.[cC][sS][vV]
+*.[cC][sS][vV].*
+*.[tT][sS][vV]
+*.[tT][sS][vV].*
+http-traffic-workbench.properties*
+.http-traffic-workbench-*.tmp
+!/examples/demo-traffic.tsv
+
+# Local credentials and logs
+.env
+.env.*
+*.log
+*.log.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
