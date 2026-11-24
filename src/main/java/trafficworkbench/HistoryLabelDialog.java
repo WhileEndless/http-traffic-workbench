@@ -407,7 +407,7 @@ final class HistoryLabelDialog extends JDialog {
                         status.setText(validation.getMessage());
                     } else {
                         status.setText("The operation failed. See the extension error log.");
-                        api.logging().logToError("Session scan · " + ex.getCause().getClass().getSimpleName());
+                        api.logging().logToError("Session scan failed.", ex.getCause());
                     }
                 } finally {
                     setEditable(true);

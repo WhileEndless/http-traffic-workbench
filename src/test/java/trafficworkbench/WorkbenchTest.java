@@ -1779,6 +1779,22 @@ final class WorkbenchTest {
     }
 
     @Test
+    void interruptedArchiveTransferKeepsExistingExport(@TempDir Path directory) throws Exception {
+        var archive = directory.resolve("preserved.tsv");
+        Files.writeString(archive, "Existing archive contents");
+
+        Thread.currentThread().interrupt();
+        try {
+            assertThrows(java.io.InterruptedIOException.class, () -> Persistence.exportArchive(archive, List.of()));
+            assertThrows(java.io.InterruptedIOException.class, () -> Persistence.importArchive(archive));
+        } finally {
+            Thread.interrupted();
+        }
+
+        assertEquals("Existing archive contents", Files.readString(archive));
+    }
+
+    @Test
     void importsLoggerCsvAndPreservesToolAttributionAcrossArchiveTransfer(@TempDir Path directory) throws Exception {
         String raw = "POST /logged HTTP/1.1\r\nContent-Type: text/plain\r\n\r\nvalue, \"a\"";
         String resp = java.util.Base64.getEncoder().encodeToString(
@@ -1833,7 +1849,7 @@ final class WorkbenchTest {
                     assertTrue(button(component, "Project settings…").isEnabled());
                     assertTrue(button(component, "Trace a cookie…").isEnabled());
                     assertTrue(button(component, "Info").isEnabled());
-                    assertEquals("v1.0.0", BuildInfo.release());
+                    assertEquals("v1.0.1", BuildInfo.release());
                     render(component, 1050, 700, "archive");
                 } finally {
                     tab.close();
@@ -1918,7 +1934,7 @@ final class WorkbenchTest {
                     render(info, preferred.width, preferred.height, "info");
                     assertTrue(hasLabel(info, "WhileEndless"));
                     assertTrue(hasLabel(info, "http-traffic-workbench"));
-                    assertTrue(hasLabel(info, "Version v1.0.0"));
+                    assertTrue(hasLabel(info, "Version v1.0.1"));
                     assertNotNull(button(info, "Open repository"));
                     assertNotNull(button(info, "Copy repository URL"));
 

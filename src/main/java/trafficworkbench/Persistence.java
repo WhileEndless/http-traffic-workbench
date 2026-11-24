@@ -9,6 +9,7 @@ import burp.api.montoya.http.message.responses.HttpResponse;
 import burp.api.montoya.persistence.PersistedObject;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -73,8 +74,8 @@ final class Persistence {
                 project.setByteArray(ARCHIVE_KEY, ByteArray.byteArray(encode(entries).getBytes(StandardCharsets.UTF_8)));
             }
             return true;
-        } catch (RuntimeException ex) {
-            api.logging().logToError("Could not save the traffic archive to the Burp project.");
+        } catch (IOException | RuntimeException ex) {
+            api.logging().logToError("Could not save the traffic archive to the Burp project.", ex);
             return false;
         }
     }
@@ -90,6 +91,7 @@ final class Persistence {
     }
 
     static void exportArchive(Path path, List<CapturedEntry> entries) throws IOException {
+        checkInterrupted();
         write(path, encode(entries));
     }
 
@@ -112,6 +114,7 @@ final class Persistence {
         Path temp = Files.createTempFile(target.getParent(), ".http-traffic-workbench-", ".tmp");
         try {
             Files.writeString(temp, value, StandardCharsets.UTF_8);
+            checkInterrupted();
             try {
                 Files.move(temp, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
                         java.nio.file.StandardCopyOption.REPLACE_EXISTING);
@@ -124,16 +127,24 @@ final class Persistence {
     }
 
     private static String read(Path path, long maxBytes) throws IOException {
+        checkInterrupted();
         if (Files.size(path) > maxBytes) {
             throw new IOException("The file exceeds the size limit.");
         }
-        return Files.readString(path, StandardCharsets.UTF_8);
+        String text = Files.readString(path, StandardCharsets.UTF_8);
+        checkInterrupted();
+        return text;
     }
 
-    private static String encode(List<CapturedEntry> entries) {
+    static void checkInterrupted() throws InterruptedIOException {
+        if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException("File operation cancelled.");
+    }
+
+    private static String encode(List<CapturedEntry> entries) throws InterruptedIOException {
         StringBuilder output = new StringBuilder(HEADER).append('\n');
         Base64.Encoder base64 = Base64.getEncoder();
         for (CapturedEntry entry : entries) {
+            checkInterrupted();
             var exchange = entry.requestResponse();
             var service = exchange.request().httpService();
             output.append(base64.encodeToString(entry.userCode().getBytes(StandardCharsets.UTF_8))).append('\t')
@@ -158,6 +169,7 @@ final class Persistence {
         int lineNo = portable ? 1 : 0;
         Base64.Decoder base64 = Base64.getDecoder();
         while (lines.hasNext()) {
+            checkInterrupted();
             String line = lines.next();
             lineNo++;
             if (line.isBlank()) {

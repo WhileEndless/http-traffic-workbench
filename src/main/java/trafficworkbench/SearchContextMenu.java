@@ -139,6 +139,17 @@ final class SearchContextMenu implements ContextMenuItemsProvider {
                 api.logging().logToOutput(accepted + " selected messages added to the traffic archive.");
                 return null;
             }
+
+            @Override protected void done() {
+                if (closed || isCancelled()) return;
+                try {
+                    get();
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                } catch (java.util.concurrent.ExecutionException ex) {
+                    api.logging().logToError("Could not archive the selected messages.", ex.getCause());
+                }
+            }
         };
         if (!scans.submit(worker)) api.logging().logToError("The scan queue is full. Try adding the selection again.");
     }

@@ -713,7 +713,7 @@ final class SearchPanel extends JPanel {
             } catch (ExecutionException ex) {
                 status.setText("Search failed. See the extension error log.");
                 if (pages.size(ResultPages.Filter.ALL) == 0) emptyResults.setText("Search failed.");
-                api.logging().logToError("Traffic search failed (" + ex.getCause().getClass().getSimpleName() + ").");
+                api.logging().logToError("Traffic search failed.", ex.getCause());
             }
         }
     }

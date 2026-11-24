@@ -24,6 +24,7 @@ final class CollectorTab {
             .withZone(ZoneId.systemDefault());
 
     private final JPanel root = new JPanel(new BorderLayout(0, 8));
+    private final MontoyaApi api;
     private final CollectorStore store;
     private final SearchContextMenu menu;
     private final Supplier<CaptureProfile> profile;
@@ -47,10 +48,13 @@ final class CollectorTab {
         refresh();
     });
     private boolean busy;
+    private boolean closed;
+    private SwingWorker<?, ?> archiveTask;
     private ProfileDialog settings;
 
     CollectorTab(MontoyaApi api, CollectorStore store, SearchContextMenu menu,
                  Supplier<CaptureProfile> profile, ProfileDialog.SaveProfile saveProfile) {
+        this.api = api;
         this.store = store;
         this.menu = menu;
         this.profile = profile;
@@ -61,7 +65,9 @@ final class CollectorTab {
         reload.setRepeats(false);
         store.setListener(() -> {
             if (reloadQueued.compareAndSet(false, true)) {
-                SwingUtilities.invokeLater(reload::start);
+                SwingUtilities.invokeLater(() -> {
+                    if (!closed) reload.start();
+                });
             }
         });
         refresh();
@@ -72,8 +78,10 @@ final class CollectorTab {
     void close() {
         store.setListener(() -> {});
         SwingUtilities.invokeLater(() -> {
+            closed = true;
             reload.stop();
-            if (settings != null) settings.dispose();
+            if (archiveTask != null) archiveTask.cancel(true);
+            if (settings != null) settings.closeOnUnload();
         });
     }
 
@@ -105,11 +113,11 @@ final class CollectorTab {
         history.addActionListener(event -> menu.open(ExtractDialog.Dataset.ALL, ExtractDialog.Context.empty()));
         archive.addActionListener(event -> menu.open(ExtractDialog.Dataset.ARCHIVE, ExtractDialog.Context.empty()));
         config.addActionListener(event -> {
-            settings = new ProfileDialog(SwingUtilities.getWindowAncestor(root), profile.get(), saveProfile);
+            settings = new ProfileDialog(SwingUtilities.getWindowAncestor(root), profile.get(), saveProfile, api.logging());
             api.userInterface().applyThemeToComponent(settings.getContentPane());
             settings.setVisible(true);
             settings = null;
-            updateStatus();
+            if (!closed) updateStatus();
         });
         for (var button : List.of(history, archive, cookies, historyLabels, config)) searchRow.add(button);
         toolbar.add(searchRow);
@@ -250,13 +258,16 @@ final class CollectorTab {
     }
 
     private void task(String message, Callable<String> task) {
+        if (closed) return;
         busy = true;
         importButton.setEnabled(false);
         updateCount();
         status.setText(message);
-        new SwingWorker<String, Void>() {
+        archiveTask = new SwingWorker<String, Void>() {
             @Override protected String doInBackground() throws Exception { return task.call(); }
             @Override protected void done() {
+                archiveTask = null;
+                if (closed) return;
                 busy = false;
                 importButton.setEnabled(true);
                 refresh();
@@ -266,10 +277,12 @@ final class CollectorTab {
                     Thread.currentThread().interrupt();
                     status.setText("Operation interrupted.");
                 } catch (ExecutionException ex) {
+                    api.logging().logToError("Archive transfer failed.", ex.getCause());
                     status.setText("The operation failed. " + ex.getCause().getMessage());
                 }
             }
-        }.execute();
+        };
+        archiveTask.execute();
     }
 
     private static final class Model extends AbstractTableModel {

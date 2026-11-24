@@ -121,6 +121,7 @@ final class LoggerCsv {
             StringBuilder field = new StringBuilder();
             boolean quoted = false;
             while (index < text.length()) {
+                if ((index & 4095) == 0) Persistence.checkInterrupted();
                 char value = text.charAt(index++);
                 if (quoted) {
                     if (value == '"') {

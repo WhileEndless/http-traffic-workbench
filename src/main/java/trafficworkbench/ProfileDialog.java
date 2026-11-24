@@ -1,5 +1,7 @@
 package trafficworkbench;
 
+import burp.api.montoya.logging.Logging;
+
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.KeyEvent;
@@ -41,12 +43,16 @@ final class ProfileDialog extends JDialog {
     private final JButton test = new JButton("Test with body…");
     private final JButton close = new JButton("Close");
     private final SaveProfile apply;
+    private final Logging logging;
     private CaptureProfile saved;
     private boolean busy;
+    private boolean closing;
+    private SwingWorker<?, ?> operation;
 
-    ProfileDialog(Window owner, CaptureProfile initial, SaveProfile apply) {
+    ProfileDialog(Window owner, CaptureProfile initial, SaveProfile apply, Logging logging) {
         super(owner, "HTTP Traffic Workbench · Project settings", ModalityType.DOCUMENT_MODAL);
         this.apply = apply;
+        this.logging = logging;
         saved = initial;
         setProfile(initial);
         build();
@@ -238,12 +244,15 @@ final class ProfileDialog extends JDialog {
     }
 
     private <T> void work(String message, Callable<T> task, java.util.function.Consumer<T> success) {
+        if (closing) return;
         busy = true;
         status.setText(message);
         for (var button : List.of(save, importButton, exportButton, test, close)) button.setEnabled(false);
-        new SwingWorker<T, Void>() {
+        operation = new SwingWorker<T, Void>() {
             @Override protected T doInBackground() throws Exception { return task.call(); }
             @Override protected void done() {
+                operation = null;
+                if (closing) return;
                 busy = false;
                 for (var button : List.of(save, importButton, exportButton, test, close)) button.setEnabled(true);
                 try {
@@ -252,10 +261,18 @@ final class ProfileDialog extends JDialog {
                     Thread.currentThread().interrupt();
                     status.setText("Operation interrupted.");
                 } catch (ExecutionException ex) {
+                    logging.logToError("Project settings operation failed.", ex.getCause());
                     status.setText("The operation failed. " + ex.getCause().getMessage());
                 }
             }
-        }.execute();
+        };
+        operation.execute();
+    }
+
+    void closeOnUnload() {
+        closing = true;
+        if (operation != null) operation.cancel(true);
+        dispose();
     }
 
     private void close() {

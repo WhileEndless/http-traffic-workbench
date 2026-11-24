@@ -76,7 +76,7 @@ public final class TrafficWorkbench implements BurpExtension, ProxyRequestHandle
             api.userInterface().registerSuiteTab(NAME, tab.uiComponent());
         });
         api.logging().logToOutput(NAME + " " + BuildInfo.release() + " loaded.");
-        api.logging().logToOutput("Planned repository · " + BuildInfo.REPOSITORY_URL);
+        api.logging().logToOutput("GitHub repository · " + BuildInfo.REPOSITORY_URL);
         api.logging().logToOutput("GitHub profile · " + BuildInfo.OWNER_URL);
     }
 

@@ -70,6 +70,7 @@ final class CollectorStore {
     int addAll(List<CapturedEntry> samples) {
         int accepted = 0;
         for (CapturedEntry entry : samples.stream().sorted(Comparator.comparingLong(CapturedEntry::time)).toList()) {
+            if (Thread.currentThread().isInterrupted()) break;
             int size = entry.size();
             if (size > MAX_SAMPLE_BYTES) continue;
             entry.contentHash();

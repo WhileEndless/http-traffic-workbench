@@ -1,19 +1,31 @@
 # HTTP Traffic Workbench
 
-**v1.0.0** · [GitHub releases](https://github.com/WhileEndless/http-traffic-workbench/releases) · [WhileEndless](https://github.com/WhileEndless)
+**v1.0.1** · [GitHub releases](https://github.com/WhileEndless/http-traffic-workbench/releases) · [WhileEndless](https://github.com/WhileEndless)
 
-HTTP Traffic Workbench is a Burp Suite extension built on the Montoya API for passive HTTP traffic search and session analysis. Follow identifiers across requests, responses, field names, and formats, and label related records in Proxy history.
+**What value did this field have for another user?** Select a value in a Burp request or response and choose **Search traffic for selection**. HTTP Traffic Workbench finds where that value appeared and surfaces comparable values already observed in other exchanges.
+
+## Follow a value through captured traffic
+
+Suppose a login request contains `username=demo-user-42`. Select `demo-user-42` and search in **Auto** mode. **Direct matches** show the same value under `userId` in a JSON response and under `accountRef` in other captured traffic. Open **Related fields** to see a comparable value, `demo-user-84`, observed under `accountRef` in a different exchange.
+
+```mermaid
+flowchart TD
+    A["Select demo-user-42 in the login request"] --> B["Search traffic for selection · Auto"]
+    B --> C["Direct matches<br/>userId: demo-user-42<br/>accountRef: demo-user-42"]
+    B --> D["Related fields<br/>accountRef: demo-user-84"]
+```
+
+Select any result to inspect the original request and response. The search runs locally over the Burp sources you select and generates no HTTP requests.
 
 ## What it does
 
-- **Find where a value appears.** An identifier submitted as a form field can also appear under a different name in JSON, an XML element, an HTML input, a JavaScript assignment, or an HTTP header. Search also reads query parameters, cookies, and JSON embedded in HTML or mislabeled as another content type.
-- **Follow the relationship between a field and its value.** Select a field name or value in a Burp message and start an **Auto** search. The extension uses the selected message for context and searches for alternate field names through exact value matches. **Related fields** can surface comparable identifiers, such as two values with the same prefix and numeric width. Direct matches score higher.
+- **Search across formats.** Search field names, values, or plain text across query parameters, headers, cookies, forms, JSON, XML, HTML, and JavaScript. Auto uses the selected message for context and ranks exact matches above comparable values.
 - **Search the sources you select.** Use Proxy history, Target Site Map, Scanner issue evidence, supported Organizer items, and imported traffic. Enable capture to include new traffic from tools such as Scanner, Repeater, Intruder, and extensions. Older Logger traffic can be added from selected messages or a Logger CSV export.
 - **Track users by session.** Select a login exchange, choose where to read the user identifier, and pick the session cookie. Preview which Proxy history records would receive the user label. Save the rule to the project or export it for another project. Search also works without user labels.
 
 ## Install
 
-1. Download `http-traffic-workbench.jar` from the [v1.0.0 release](https://github.com/WhileEndless/http-traffic-workbench/releases/tag/v1.0.0).
+1. Download `http-traffic-workbench.jar` from [GitHub Releases](https://github.com/WhileEndless/http-traffic-workbench/releases), or build the JAR from this checkout.
 2. In Burp Suite 2025.5 or later, open **Extensions → Installed → Add**.
 3. Choose **Java**, select the JAR, and click **Next** to load it. Open the **HTTP Traffic Workbench** tab.
 

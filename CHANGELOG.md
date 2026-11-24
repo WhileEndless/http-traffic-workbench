@@ -1,5 +1,11 @@
 # Release notes
 
+## 1.0.1
+
+- Illustrate how a selected value leads to exact matches and comparable values in captured traffic.
+- Cancel active archive transfers and project settings work when the extension unloads.
+- Include background search, archive, and project settings failures in the Burp extension error log.
+
 ## 1.0.0
 
 First public release of HTTP Traffic Workbench for Burp Suite 2025.5 and later.
