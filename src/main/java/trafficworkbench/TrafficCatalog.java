@@ -8,10 +8,12 @@ import burp.api.montoya.organizer.Organizer;
 
 import java.lang.reflect.Method;
 import java.util.Collection;
+import java.util.List;
 import java.util.Objects;
 import java.util.Iterator;
 import java.util.Spliterators;
 import java.util.Spliterator;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.stream.StreamSupport;
@@ -47,6 +49,34 @@ final class TrafficCatalog {
 
     static boolean matchesHost(String host, HttpService service) {
         return host.isEmpty() || service != null && host.equalsIgnoreCase(service.host());
+    }
+
+    String selectedUser(CapturedEntry selected, CaptureProfile profile, BooleanSupplier cancelled) {
+        if (selected == null || cancelled.getAsBoolean()) return "";
+        if (!selected.userCode().isEmpty()) return selected.userCode();
+        var exchange = selected.requestResponse();
+        if (selected.source() == TrafficSource.PROXY) {
+            try {
+                String host = exchange.request().httpService().host();
+                var nativeRow = new SessionAnchor(exchange, null, "")
+                        .resolve(proxyHistory(host), cancelled).item();
+                var annotations = nativeRow == null ? null : nativeRow.annotations();
+                return annotations == null ? "" : UserLabeler.readNote(annotations.notes(), profile);
+            } catch (RuntimeException ignored) {
+                return "";
+            }
+        }
+
+        String endpoint = CapturedEntry.endpoint(exchange.request());
+        String label = null;
+        for (var entry : store.all()) {
+            if (cancelled.getAsBoolean()) return "";
+            if (entry.source() != selected.source() || !endpoint.equals(CapturedEntry.endpoint(entry.requestResponse().request()))
+                    || !selected.matches(entry)) continue;
+            if (entry.userCode().isEmpty() || label != null && !label.equals(entry.userCode())) return "";
+            label = entry.userCode();
+        }
+        return Objects.toString(label, "");
     }
 
     static Stream<CapturedEntry> includeSelected(Stream<CapturedEntry> records, CapturedEntry selected) {
@@ -99,7 +129,7 @@ final class TrafficCatalog {
 
     private Stream<CapturedEntry> projectSource(TrafficSource source, CaptureProfile profile, String host) {
         return switch (source) {
-            case PROXY -> proxyHistory(host).map(item -> {
+            case PROXY -> proxyHistory(host).stream().map(item -> {
                 var request = ProxyMessages.request(item);
                 if (request == null || request.httpService() == null || !matchesHost(host, request.httpService())) return null;
                 var time = item.time();
@@ -116,15 +146,15 @@ final class TrafficCatalog {
         };
     }
 
-    private Stream<burp.api.montoya.proxy.ProxyHttpRequestResponse> proxyHistory(String host) {
+    private List<burp.api.montoya.proxy.ProxyHttpRequestResponse> proxyHistory(String host) {
         var proxy = api.proxy();
-        if (host.isEmpty()) return proxy.history().stream();
+        if (host.isEmpty()) return proxy.history();
         return proxy.history(item -> {
             var service = item.httpService();
             if (service != null) return matchesHost(host, service);
             var request = ProxyMessages.request(item);
             return request != null && matchesHost(host, request.httpService());
-        }).stream();
+        });
     }
 
     static CapturedEntry record(HttpRequestResponse exchange, Annotations annotations, long time,

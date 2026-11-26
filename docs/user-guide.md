@@ -28,6 +28,10 @@ Build from source with JDK 17 or later and Maven. Run `mvn clean package` to run
 
 **Depth** defaults to **1**. In **Auto**, selecting a key in a structured message searches for the key both as a field name and as a literal value. Its paired value can then lead to other fields, even when the source message is outside the selected traffic sources. Selecting the value does the reverse. For example, from `customerRef=demo-7428`, Auto can find `targetField=customerRef` and a response field `reference` containing `demo-7428`.
 
+When a search starts from an HTTP message with a known user label, results for the same user and host display the label in an accent color in the **User** column.
+
+Use **Hide source user** beside **Results** to hide those rows, including matches that arrive while the search is running. Clear the checkbox to restore the rows from the current search.
+
 An HTML control searched by `name` or its explicit `id` can lead to other fields through its `value`, including URL-encoded equivalents and cross-format matches. When searching by value, the submitted `name` identifies the field. An ID-only control can corroborate an exact key match in another structured message. **Depth 2–3** can follow comparable values through an established field to further exact matches.
 
 **Auto**, **Field name**, and **Field value** compare literal terms first and recognize one layer of URL percent encoding or HTML character references. For example, `17/08/2018`, `17%2F08%2F2018`, and `17&#47;08&#47;2018` can match the same field. The comparison also works when a field contains the encoded spelling. A selected form exchange can supply its declared charset when the decoded term matches one of its fields. **Auto** can also match encoded text when no structured match is available. **Text** keeps the entered spelling for literal and regex searches.

@@ -83,7 +83,9 @@ final class SearchPanel extends JPanel {
     private final Timer responseRefresh = new Timer(400, event -> waitForResponse());
     private int responseChecks;
     private final JComboBox<ResultPages.Filter> resultFilter = new JComboBox<>(ResultPages.Filter.values());
+    private final JCheckBox hideOriginUser = new JCheckBox("Hide source user");
     private final ResultPages pages = new ResultPages();
+    private final ResultPages otherUserPages = new ResultPages();
     private SearchWorker worker;
     private Set<TrafficSource> lastSources;
     private boolean updatingPage;
@@ -100,7 +102,9 @@ final class SearchPanel extends JPanel {
         this.context = context;
         initialQuery = context.selection().replace("\r", "\\r").replace("\n", "\\n");
         var selectedRequest = context.selectedExchange() == null ? null : context.selectedExchange().exchange().request();
-        setReferenceHost(selectedRequest == null ? null : selectedRequest.httpService());
+        var selectedService = selectedRequest == null ? null : selectedRequest.httpService();
+        model.originHost = selectedService == null ? "" : selectedService.host();
+        setReferenceHost(selectedService);
         sameHost.setVisible(context.cookie() == null);
         Set<TrafficSource> allowedSources = context.cookie() != null && context.cookie().followReplacements()
                 ? Set.of(TrafficSource.PROXY) : java.util.EnumSet.allOf(TrafficSource.class);
@@ -258,6 +262,7 @@ final class SearchPanel extends JPanel {
             table.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
         }
         table.getColumnModel().getColumn(0).setCellRenderer(new SearchResultRenderer(true));
+        table.getColumnModel().getColumn(1).setCellRenderer(new SearchResultRenderer(model::isOriginUser));
         table.getSelectionModel().addListSelectionListener(event -> {
             if (!event.getValueIsAdjusting() && !updatingPage) {
                 queuePreview();
@@ -267,6 +272,15 @@ final class SearchPanel extends JPanel {
         var resultTools = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         resultTools.add(labeled("Results", resultFilter));
         resultFilter.addActionListener(event -> showPage(0));
+        if (context.selectedExchange() != null && context.cookie() == null) {
+            hideOriginUser.setEnabled(false);
+            hideOriginUser.setToolTipText("Hide matches for the user from the message that started this search.");
+            hideOriginUser.addActionListener(event -> {
+                updatePage(page, true);
+                showPreview();
+            });
+            resultTools.add(hideOriginUser);
+        }
         results.add(resultTools, BorderLayout.NORTH);
         var tableView = new JScrollPane(table);
         tableView.setColumnHeaderView(table.getTableHeader());
@@ -354,7 +368,10 @@ final class SearchPanel extends JPanel {
     private void resetSearch() {
         lastSources = null;
         cancel();
+        model.originUser = "";
+        hideOriginUser.setEnabled(false);
         pages.clear();
+        otherUserPages.clear();
         showPage(0);
         status.setText("Ready to search.");
         emptyResults.setText("Enter a search term or select Browse traffic.");
@@ -401,7 +418,10 @@ final class SearchPanel extends JPanel {
                 context.cookie() == null ? (Integer) depth.getValue() : 0,
                 profile.get(), sameHost.isEnabled() && sameHost.isSelected() ? referenceHost : "",
                 expression, regexSearch, exclude);
+        model.originUser = "";
         pages.clear();
+        otherUserPages.clear();
+        hideOriginUser.setEnabled(context.selectedExchange() != null && context.cookie() == null && !needle.isEmpty());
         showPage(0);
         status.setText(needle.isEmpty() ? "Preparing to browse traffic…" : "Preparing search…");
         emptyResults.setText(needle.isEmpty() ? "Waiting for traffic…" : "Waiting for matches…");
@@ -429,6 +449,7 @@ final class SearchPanel extends JPanel {
             active.refreshTimer.stop();
             worker = null;
             scans.cancel(active);
+            hideOriginUser.setEnabled(!model.originUser.isEmpty());
             updatePage(page, true);
             status.setText("Search stopped · " + matchSummary() + " retained.");
             if (pages.size(ResultPages.Filter.ALL) == 0) emptyResults.setText("Search stopped.");
@@ -523,9 +544,12 @@ final class SearchPanel extends JPanel {
     }
 
     private void updatePage(int index, boolean preserveSelection) {
-        page = index;
         var filter = (ResultPages.Filter) resultFilter.getSelectedItem();
-        var visible = pages.page(filter, index);
+        var view = hideOriginUser.isSelected() && !model.originUser.isEmpty() ? otherUserPages : pages;
+        int total = view.size(filter);
+        int hidden = pages.size(filter) - total;
+        page = Math.min(index, Math.max(0, total - 1) / ResultPages.PAGE_SIZE);
+        var visible = view.page(filter, page);
         if (!model.current.equals(visible) || !preserveSelection) {
             var selected = preserveSelection
                     ? Arrays.stream(table.getSelectedRows()).mapToObj(indexInPage -> model.current.get(indexInPage).id)
@@ -543,16 +567,21 @@ final class SearchPanel extends JPanel {
             }
             queuePreview();
         }
-        int total = pages.size(filter);
         if (visible.isEmpty() && pages.size(ResultPages.Filter.ALL) > 0) {
-            emptyResults.setText(worker == null ? "No matches in this view." : "Waiting for matches in this view…");
+            if (hidden > 0) {
+                emptyResults.setText(worker == null ? "All matches in this view are from the source user."
+                        : "Source user matches hidden. Waiting for other matches…");
+            } else {
+                emptyResults.setText(worker == null ? "No matches in this view." : "Waiting for matches in this view…");
+            }
         }
         resultLayout.show(resultCards, visible.isEmpty() ? "empty" : "table");
-        int from = index * ResultPages.PAGE_SIZE;
-        previous.setEnabled(index > 0);
+        int from = page * ResultPages.PAGE_SIZE;
+        previous.setEnabled(page > 0);
         next.setEnabled(from + visible.size() < total && !visible.isEmpty());
         copyPage.setEnabled(!visible.isEmpty());
-        pageLabel.setText(visible.isEmpty() ? "0 results" : (from + 1) + "–" + (from + visible.size()) + " / " + total);
+        String range = visible.isEmpty() ? "0 results" : (from + 1) + "–" + (from + visible.size()) + " / " + total;
+        pageLabel.setText(hidden == 0 ? range : range + " · " + hidden + " hidden");
     }
 
     private void copy(boolean selectedOnly) {
@@ -598,13 +627,20 @@ final class SearchPanel extends JPanel {
         private boolean countedScan;
         private volatile int scanned;
         private volatile String phase = "Reading selected sources";
+        private volatile String originUser = "";
 
         private SearchWorker(Options options) {
             this.options = options;
         }
 
         @Override protected SearchResults doInBackground() {
-            Iterable<CapturedEntry> entries = loadEntries();
+            var catalog = new TrafficCatalog(api, store);
+            var selectedExchange = context.selectedExchange();
+            var selectedEntry = selectedExchange == null ? null : selectedExchange.entry(options.profile());
+            if (!options.needle().isEmpty()) {
+                originUser = catalog.selectedUser(selectedEntry, options.profile(), this::isCancelled);
+            }
+            Iterable<CapturedEntry> entries = loadEntries(catalog, selectedEntry);
             var engine = new ExtractEngine(entries, -1, context.path(), options.depth(), options.siblings(),
                     options.direction(), options.partial(), options.collapseRepeated(), this);
             if (options.needle().isEmpty()) {
@@ -630,9 +666,9 @@ final class SearchPanel extends JPanel {
             return new SearchResults(scanned, engine.truncated() || engine.discoveryLimited());
         }
 
-        private Iterable<CapturedEntry> loadEntries() {
+        private Iterable<CapturedEntry> loadEntries(TrafficCatalog catalog, CapturedEntry active) {
             return () -> {
-                var records = new TrafficCatalog(api, store).stream(options.sources(), options.profile(), options.host());
+                var records = catalog.stream(options.sources(), options.profile(), options.host());
                 if (context.cookie() != null) {
                     records = records.takeWhile(entry -> !isCancelled()).filter(entry ->
                             context.cookie().appliesTo(entry.requestResponse().request().httpService()));
@@ -643,13 +679,10 @@ final class SearchPanel extends JPanel {
                     }
                 } else {
                     records = records.filter(options.traffic()::matches);
-                    var selected = context.selectedExchange();
-                    if (selected != null && options.sources().contains(selected.source())) {
-                        var active = selected.entry(options.profile());
-                        if (active != null && TrafficCatalog.matchesHost(options.host(), active.requestResponse().request().httpService())
-                                && options.traffic().matches(active)) {
-                            records = TrafficCatalog.includeSelected(records, active);
-                        }
+                    if (active != null && options.sources().contains(active.source())
+                            && TrafficCatalog.matchesHost(options.host(), active.requestResponse().request().httpService())
+                            && options.traffic().matches(active)) {
+                        records = TrafficCatalog.includeSelected(records, active);
                     }
                 }
                 if (countedScan) return records.iterator();
@@ -667,7 +700,14 @@ final class SearchPanel extends JPanel {
 
         @Override protected void process(List<List<ResultRow>> chunks) {
             if (worker != this) return;
-            for (var batch : chunks) pages.add(batch);
+            model.originUser = originUser;
+            hideOriginUser.setEnabled(!originUser.isEmpty());
+            for (var batch : chunks) {
+                pages.add(batch);
+                if (!originUser.isEmpty()) {
+                    otherUserPages.add(batch.stream().filter(row -> !model.isOriginUser(row)).toList());
+                }
+            }
             pageDirty = true;
             if (firstBatch) {
                 firstBatch = false;
@@ -694,6 +734,7 @@ final class SearchPanel extends JPanel {
             refreshTimer.stop();
             worker = null;
             setSearchRunning(false);
+            hideOriginUser.setEnabled(!model.originUser.isEmpty());
             updatePage(page, true);
             try {
                 SearchResults result = get();
@@ -723,6 +764,17 @@ final class SearchPanel extends JPanel {
 
     private static final class Model extends AbstractTableModel {
         private List<ResultRow> current = List.of();
+        private String originUser = "";
+        private String originHost = "";
+
+        boolean isOriginUser(int row) {
+            return isOriginUser(current.get(row));
+        }
+
+        boolean isOriginUser(ResultRow match) {
+            return !originUser.isEmpty() && originUser.equals(match.userCode)
+                    && TrafficCatalog.matchesHost(originHost, match.entry.requestResponse().request().httpService());
+        }
         public int getRowCount() { return current.size(); }
         public int getColumnCount() { return COLUMNS.length; }
         public String getColumnName(int col) { return COLUMNS[col]; }

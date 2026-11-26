@@ -1,5 +1,10 @@
 # Release notes
 
+## 1.1.0
+
+- Highlight the originating user in the **User** column when searching from a labeled HTTP message. The highlight applies to matching user labels on the same host.
+- Add **Hide source user** to the search results. It filters displayed and incoming matches during a search. Clear the checkbox to restore hidden rows without running the search again.
+
 ## 1.0.2
 
 - Fix selection-based searches in formatted HTTP editors by reading the selected text directly and preserving line breaks in the search term.

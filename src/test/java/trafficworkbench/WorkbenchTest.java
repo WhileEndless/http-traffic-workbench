@@ -1900,6 +1900,166 @@ final class WorkbenchTest {
     }
 
     @Test
+    void searchHighlightsOnlyTheOriginUserFromNativeHistoryOnTheSameHost() throws Exception {
+        String needle = "demo-match";
+        String origin = "demo-origin";
+        var opener = request("GET", "/origin", "", null, Map.of(), HOST);
+        var hit = response(needle, "text/plain", Map.of());
+        var selected = exchange(opener, hit);
+        var records = List.of(history(opener, hit, "User: " + origin, TIME),
+                history(request("GET", "/same-user", "", null, Map.of(), HOST), hit, "User: " + origin, TIME + 1),
+                history(request("GET", "/other-user", "", null, Map.of(), HOST), hit, "User: demo-other", TIME + 2),
+                history(request("GET", "/unlabeled", "", null, Map.of(), HOST), hit, "", TIME + 3),
+                history(request("GET", "/other-host", "", null, Map.of(), "other.example.test"), hit, "User: " + origin, TIME + 4));
+        var proxy = mock(burp.api.montoya.proxy.Proxy.class, (name, args) -> records);
+        var ui = offscreenUi();
+        var api = mock(MontoyaApi.class, (name, args) -> name.equals("proxy") ? proxy : ui);
+        var store = new CollectorStore(persistence());
+        var scans = new ScanQueue();
+        var panel = new AtomicReference<SearchPanel>();
+        var completed = new java.util.concurrent.CountDownLatch(1);
+        try {
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                var context = new ExtractDialog.Context(needle, CapturedEntry.endpoint(opener), List::of, null,
+                        new ExtractDialog.SelectedExchange(selected, TrafficSource.PROXY));
+                var search = new SearchPanel(api, store, scans, CaptureProfile::defaults,
+                        ExtractDialog.Dataset.HISTORY, context, () -> {});
+                panel.set(search);
+                find(search, javax.swing.JCheckBox.class, box -> box.getText().equals("Same host")).setSelected(false);
+                button(search, "Stop").addPropertyChangeListener("enabled", event -> {
+                    if (Boolean.FALSE.equals(event.getNewValue())) completed.countDown();
+                });
+                search.searchSelection();
+            });
+            assertTrue(completed.await(3, java.util.concurrent.TimeUnit.SECONDS));
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                var table = find(panel.get(), javax.swing.JTable.class);
+                assertEquals(5, table.getRowCount());
+                for (var background : List.of(java.awt.Color.WHITE, new java.awt.Color(0x23262B))) {
+                    table.setBackground(background);
+                    table.setForeground(background.equals(java.awt.Color.WHITE) ? java.awt.Color.BLACK : java.awt.Color.WHITE);
+                    for (int row = 0; row < table.getRowCount(); row++) {
+                        String endpoint = table.getValueAt(row, 2).toString();
+                        boolean marked = endpoint.endsWith("/origin") || endpoint.endsWith("/same-user");
+                        var value = table.getValueAt(row, 1);
+                        var renderer = table.getCellRenderer(row, 1);
+                        var cell = (javax.swing.JLabel) renderer.getTableCellRendererComponent(table, value, false, false, row, 1);
+                        assertEquals(value, cell.getText());
+                        assertEquals(table.getFont(), cell.getFont());
+                        assertEquals(marked, cell.getToolTipText() != null);
+                        assertEquals(marked, !table.getForeground().equals(cell.getForeground()));
+                        if (marked) {
+                            assertEquals(origin, value);
+                            assertEquals(table.getSelectionForeground(),
+                                    renderer.getTableCellRendererComponent(table, value, true, false, row, 1).getForeground());
+                        }
+                    }
+                }
+            });
+        } finally {
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                if (panel.get() != null) panel.get().close();
+            });
+            scans.close();
+            store.flushAndShutdown();
+        }
+    }
+
+    @Test
+    void hidingTheOriginUserFiltersStreamingResultsAndRestoresThemWithoutRescanning() throws Exception {
+        String needle = "demo-match";
+        String sourceNotes = "User: demo-source";
+        var opener = request("GET", "/origin", "", null, Map.of(), HOST);
+        var answer = response(needle, "text/plain", Map.of());
+        var selected = mock(HttpRequestResponse.class, (name, args) -> switch (name) {
+            case "request" -> opener;
+            case "response" -> answer;
+            case "annotations" -> annotations(sourceNotes);
+            default -> null;
+        });
+        var records = List.of(history(opener, answer, sourceNotes, TIME),
+                history(request("GET", "/same-user", "", null, Map.of(), HOST), answer, sourceNotes, TIME + 1),
+                history(request("GET", "/other-user", "", null, Map.of(), HOST), answer, "User: demo-other", TIME + 2));
+        var releaseRemaining = new java.util.concurrent.CountDownLatch(1);
+        var firstVisible = new java.util.concurrent.CountDownLatch(1);
+        var completed = new java.util.concurrent.CountDownLatch(1);
+        var streaming = new java.util.AbstractList<ProxyHttpRequestResponse>() {
+            @Override public int size() { return records.size(); }
+            @Override public ProxyHttpRequestResponse get(int index) {
+                if (index > 0) {
+                    try {
+                        if (!releaseRemaining.await(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                            throw new AssertionError("The remaining history was not released.");
+                        }
+                    } catch (InterruptedException ex) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                return records.get(index);
+            }
+        };
+        var reads = new AtomicInteger();
+        var proxy = mock(burp.api.montoya.proxy.Proxy.class, (name, args) -> {
+            reads.incrementAndGet();
+            return streaming;
+        });
+        var ui = offscreenUi();
+        var api = mock(MontoyaApi.class, (name, args) -> name.equals("proxy") ? proxy : ui);
+        var store = new CollectorStore(persistence());
+        var scans = new ScanQueue();
+        var panel = new AtomicReference<SearchPanel>();
+        try {
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                var context = new ExtractDialog.Context(needle, CapturedEntry.endpoint(opener), List::of, null,
+                        new ExtractDialog.SelectedExchange(selected, TrafficSource.PROXY));
+                var search = new SearchPanel(api, store, scans, CaptureProfile::defaults,
+                        ExtractDialog.Dataset.HISTORY, context, () -> {});
+                panel.set(search);
+                var table = find(search, javax.swing.JTable.class);
+                table.getModel().addTableModelListener(event -> {
+                    if (table.getRowCount() == 1) firstVisible.countDown();
+                });
+                button(search, "Stop").addPropertyChangeListener("enabled", event -> {
+                    if (Boolean.FALSE.equals(event.getNewValue())) completed.countDown();
+                });
+                search.searchSelection();
+            });
+            assertTrue(firstVisible.await(3, java.util.concurrent.TimeUnit.SECONDS));
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                var search = panel.get();
+                var table = find(search, javax.swing.JTable.class);
+                table.setRowSelectionInterval(0, 0);
+                assertTrue(button(search, "Stop").isEnabled());
+                find(search, javax.swing.JCheckBox.class, box -> box.getText().equals("Hide source user")).doClick();
+                assertEquals(0, table.getRowCount());
+                assertEquals(-1, table.getSelectedRow());
+                assertTrue(hasLabel(search, "0 results · 1 hidden"));
+            });
+            releaseRemaining.countDown();
+            assertTrue(completed.await(3, java.util.concurrent.TimeUnit.SECONDS));
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                var search = panel.get();
+                var table = find(search, javax.swing.JTable.class);
+                assertEquals(1, table.getRowCount());
+                assertEquals("demo-other", table.getValueAt(0, 1));
+                assertTrue(hasLabel(search, "1–1 / 1 · 2 hidden"));
+                int completedReads = reads.get();
+                find(search, javax.swing.JCheckBox.class, box -> box.getText().equals("Hide source user")).doClick();
+                assertEquals(3, table.getRowCount());
+                assertEquals(completedReads, reads.get());
+                assertFalse(button(search, "Stop").isEnabled());
+            });
+        } finally {
+            releaseRemaining.countDown();
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                if (panel.get() != null) panel.get().close();
+            });
+            scans.close();
+            store.flushAndShutdown();
+        }
+    }
+
+    @Test
     void defaultSearchShowsRepeatedAndRelatedProxyFormsWithoutInferringDomIdReferences() throws Exception {
         String formName = "demo01$WorkspaceContent$InventoryFilter2$FromDateControl$DateInput";
         String wireName = formName.replace("$", "%24");
@@ -2148,7 +2308,7 @@ final class WorkbenchTest {
                     assertTrue(button(component, "Project settings…").isEnabled());
                     assertTrue(button(component, "Trace a cookie…").isEnabled());
                     assertTrue(button(component, "Info").isEnabled());
-                    assertEquals("v1.0.2", BuildInfo.release());
+                    assertEquals("v1.1.0", BuildInfo.release());
                     render(component, 1050, 700, "archive");
                 } finally {
                     tab.close();
@@ -2233,7 +2393,7 @@ final class WorkbenchTest {
                     render(info, preferred.width, preferred.height, "info");
                     assertTrue(hasLabel(info, "WhileEndless"));
                     assertTrue(hasLabel(info, "http-traffic-workbench"));
-                    assertTrue(hasLabel(info, "Version v1.0.2"));
+                    assertTrue(hasLabel(info, "Version v1.1.0"));
                     assertNotNull(button(info, "Open repository"));
                     assertNotNull(button(info, "Copy repository URL"));
 
