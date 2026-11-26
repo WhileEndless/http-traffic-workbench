@@ -4,6 +4,7 @@ import burp.api.montoya.core.Annotations;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.proxy.ProxyHttpRequestResponse;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -15,8 +16,9 @@ final class HistoryLabeler {
 
     record Change(Annotations annotations, String label) {}
     record Example(String url, String label) {}
-    record Plan(String prefix, List<Change> changes, List<Example> sample, int scanned, int existing,
-                int distinctUsers, boolean limited) {}
+    record Plan(CaptureProfile profile, List<Change> changes, List<Example> sample, int scanned, int existing,
+                int conflicts, int undated, int distinctUsers, boolean limited) {}
+    record ApplyResult(int added, int existing, int conflicts, int failed) {}
 
     private HistoryLabeler() {}
 
@@ -28,23 +30,37 @@ final class HistoryLabeler {
     static Plan plan(List<ProxyHttpRequestResponse> history, CaptureProfile.Compiled profile,
                      ProxyHttpRequestResponse anchor, BooleanSupplier cancelled, IntConsumer progress) {
         var filtered = new ArrayList<TimedEntry>();
+        int undated = 0;
         for (var record : history) {
             if (cancelled.getAsBoolean()) break;
             HttpRequest request = ProxyMessages.request(record);
             if (request != null && profile.covers(request)) {
-                var timestamp = record.time();
-                long time = timestamp == null ? 0 : timestamp.toInstant().toEpochMilli();
-                filtered.add(new TimedEntry(record, request, time));
+                var timing = record.timingData();
+                var sent = timing == null ? null : timing.timeRequestSent();
+                if (sent == null) sent = record.time();
+                var time = sent == null ? null : sent.toInstant();
+                if (time == null) {
+                    if (record == anchor) throw new IllegalArgumentException("The selected login has no timestamp.");
+                    undated++;
+                } else {
+                    var duration = timing == null ? null : timing.timeBetweenRequestSentAndEndOfResponse();
+                    if (timing != null && duration == null) duration = timing.timeBetweenRequestSentAndStartOfResponse();
+                    var completed = duration == null || duration.isNegative() ? time : time.plus(duration);
+                    long responseTime = completed.toEpochMilli();
+                    // Round up so an earlier request in the same millisecond cannot inherit a future response.
+                    if (completed.getNano() % 1_000_000 != 0) responseTime++;
+                    filtered.add(new TimedEntry(record, request, time, responseTime));
+                }
             }
         }
-        filtered.sort(Comparator.comparingLong(TimedEntry::time));
+        filtered.sort(Comparator.comparing(TimedEntry::time));
         var labeler = new UserLabeler();
         var changes = new ArrayList<Change>();
         var users = new java.util.HashSet<String>();
         var sample = new ArrayList<Example>(50);
-        String prefix = profile.settings().notePrefix();
         int scanned = 0;
         int existing = 0;
+        int conflicts = 0;
         boolean limited = false;
         boolean reachedAnchor = anchor == null;
         for (TimedEntry entry : filtered) {
@@ -58,13 +74,18 @@ final class HistoryLabeler {
                 java.util.concurrent.locks.LockSupport.parkNanos(1_000_000);
             }
             String label = labeler.label(profile, entry.request(), ProxyMessages.response(record),
-                    Util.MAX_BODY_BYTES, entry.time(), anchor == null || record == anchor);
+                    Util.MAX_BODY_BYTES, entry.time().toEpochMilli(), entry.responseTime(), anchor == null || record == anchor);
+            if (record == anchor && !labeler.hasSession()) {
+                throw new IllegalArgumentException("The selected login could not establish a session. Check the response status, identifier and cookie.");
+            }
             if (label.isEmpty() || !profile.includesPath(entry.request())) continue;
             var annotations = record.annotations();
             if (annotations == null) continue;
             users.add(label);
-            if (hasLabel(annotations.notes(), prefix)) {
+            String current = UserLabeler.readNote(annotations.notes(), profile.settings());
+            if (!current.isEmpty()) {
                 existing++;
+                if (!current.equals(label)) conflicts++;
             } else if (changes.size() < MAX_CHANGES) {
                 changes.add(new Change(annotations, label));
                 if (sample.size() < 50) sample.add(new Example(entry.request().url(), label));
@@ -72,11 +93,16 @@ final class HistoryLabeler {
                 limited = true;
             }
         }
-        return new Plan(prefix, List.copyOf(changes), List.copyOf(sample), scanned, existing, users.size(), limited);
+        if (!cancelled.getAsBoolean()) progress.accept(100);
+        return new Plan(profile.settings(), List.copyOf(changes), List.copyOf(sample), scanned, existing, conflicts,
+                undated, users.size(), limited);
     }
 
-    static int apply(Plan plan, BooleanSupplier cancelled, IntConsumer progress) {
+    static ApplyResult apply(Plan plan, BooleanSupplier cancelled, IntConsumer progress) {
         int applied = 0;
+        int existing = 0;
+        int conflicts = 0;
+        int failed = 0;
         int i = 0;
         for (Change change : plan.changes()) {
             if (cancelled.getAsBoolean()) break;
@@ -84,19 +110,24 @@ final class HistoryLabeler {
                 progress.accept((int) (100L * i / plan.changes().size()));
                 java.util.concurrent.locks.LockSupport.parkNanos(1_000_000);
             }
-            Annotations annotations = change.annotations();
-            String notes = annotations.notes();
-            if (!hasLabel(notes, plan.prefix())) {
-                annotations.setNotes(UserLabeler.noteText(notes, plan.prefix(), change.label()));
-                applied++;
+            try {
+                Annotations annotations = change.annotations();
+                String notes = annotations.notes();
+                String current = UserLabeler.readNote(notes, plan.profile());
+                if (current.isEmpty()) {
+                    annotations.setNotes(UserLabeler.noteText(notes, plan.profile().notePrefix(), change.label()));
+                    applied++;
+                } else {
+                    existing++;
+                    if (!current.equals(change.label())) conflicts++;
+                }
+            } catch (RuntimeException ex) {
+                failed++;
             }
         }
-        return applied;
+        if (!cancelled.getAsBoolean()) progress.accept(100);
+        return new ApplyResult(applied, existing, conflicts, failed);
     }
 
-    private static boolean hasLabel(String notes, String prefix) {
-        return notes != null && notes.lines().anyMatch(line -> line.startsWith(prefix + ": "));
-    }
-
-    private record TimedEntry(ProxyHttpRequestResponse record, HttpRequest request, long time) {}
+    private record TimedEntry(ProxyHttpRequestResponse record, HttpRequest request, Instant time, long responseTime) {}
 }

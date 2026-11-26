@@ -1,6 +1,6 @@
 # HTTP Traffic Workbench
 
-**v1.0.1** · [GitHub releases](https://github.com/WhileEndless/http-traffic-workbench/releases) · [WhileEndless](https://github.com/WhileEndless)
+**v1.0.2** · [GitHub releases](https://github.com/WhileEndless/http-traffic-workbench/releases) · [WhileEndless](https://github.com/WhileEndless)
 
 **What value did this field have for another user?** Select a value in a Burp request or response and choose **Search traffic for selection**. HTTP Traffic Workbench finds where that value appeared and surfaces comparable values already observed in other exchanges.
 

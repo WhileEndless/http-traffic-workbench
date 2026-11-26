@@ -71,7 +71,7 @@ final class ToolTrafficCapture implements HttpHandler {
         long bodyBytes = (long) request.body().length() + (response == null ? 0 : response.body().length());
         if (bodyBytes > MAX_SAMPLE_BYTES) return;
         var exchange = HttpRequestResponse.httpRequestResponse(request, response);
-        var entry = TrafficCatalog.record(exchange, annotations, time, origin, 0, profile.settings().notePrefix());
+        var entry = TrafficCatalog.record(exchange, annotations, time, origin, 0, profile.settings());
         if (entry == null) return;
         var key = new MessageKey(origin, id);
         if (response == null) {

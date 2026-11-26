@@ -23,6 +23,15 @@ final class Cookies {
             return value.isEmpty() || (maxAge != null ? maxAge <= 0 : expires != null && expires <= time);
         }
 
+        long expiryAt(long time) {
+            if (maxAge == null) return expires == null ? Long.MAX_VALUE : expires;
+            try {
+                return Math.addExact(time, Math.multiplyExact(maxAge, 1_000L));
+            } catch (ArithmeticException overflow) {
+                return Long.MAX_VALUE;
+            }
+        }
+
         @Override public String toString() {
             return name + (response ? " · Response Set-Cookie" : " · Request Cookie");
         }

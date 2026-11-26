@@ -29,15 +29,15 @@ final class TrafficCatalog {
         this.store = store;
     }
 
-    Stream<CapturedEntry> stream(Set<TrafficSource> selected, String prefix) {
-        return stream(selected, prefix, "");
+    Stream<CapturedEntry> stream(Set<TrafficSource> selected, CaptureProfile profile) {
+        return stream(selected, profile, "");
     }
 
-    Stream<CapturedEntry> stream(Set<TrafficSource> selected, String prefix, String host) {
+    Stream<CapturedEntry> stream(Set<TrafficSource> selected, CaptureProfile profile, String host) {
         Stream<CapturedEntry> project = Stream.empty();
         for (TrafficSource source : TrafficSource.values()) {
             if (selected.contains(source) && !source.toolTraffic() && source != TrafficSource.ARCHIVE) {
-                project = Stream.concat(project, deferred(() -> availableSource(source, prefix, host)));
+                project = Stream.concat(project, deferred(() -> availableSource(source, profile, host)));
             }
         }
         Stream<CapturedEntry> archive = store.all().stream().filter(entry -> selected.contains(entry.source()));
@@ -50,6 +50,18 @@ final class TrafficCatalog {
     }
 
     static Stream<CapturedEntry> includeSelected(Stream<CapturedEntry> records, CapturedEntry selected) {
+        if (selected.source() == TrafficSource.PROXY) {
+            // Use native history annotations whenever the context exchange is already present.
+            var found = new java.util.concurrent.atomic.AtomicBoolean();
+            String endpoint = CapturedEntry.endpoint(selected.requestResponse().request());
+            var nativeRecords = records.peek(entry -> {
+                if (!found.get() && entry.source() == TrafficSource.PROXY
+                        && endpoint.equals(CapturedEntry.endpoint(entry.requestResponse().request())) && selected.matches(entry)) {
+                    found.set(true);
+                }
+            });
+            return Stream.concat(nativeRecords, Stream.of(selected).filter(entry -> !found.get()));
+        }
         // Substitute one existing copy while retaining repeated traffic and native metadata on other records.
         var pendingDuplicate = new java.util.concurrent.atomic.AtomicBoolean(true);
         var key = selected.key();
@@ -76,16 +88,16 @@ final class TrafficCatalog {
         }, false);
     }
 
-    private Stream<CapturedEntry> availableSource(TrafficSource source, String prefix, String host) {
+    private Stream<CapturedEntry> availableSource(TrafficSource source, CaptureProfile profile, String host) {
         try {
-            return projectSource(source, prefix, host);
+            return projectSource(source, profile, host);
         } catch (RuntimeException ex) {
             api.logging().logToError(source.label + " could not be opened (" + ex.getClass().getSimpleName() + ").");
             return Stream.empty();
         }
     }
 
-    private Stream<CapturedEntry> projectSource(TrafficSource source, String prefix, String host) {
+    private Stream<CapturedEntry> projectSource(TrafficSource source, CaptureProfile profile, String host) {
         return switch (source) {
             case PROXY -> proxyHistory(host).map(item -> {
                 var request = ProxyMessages.request(item);
@@ -93,13 +105,13 @@ final class TrafficCatalog {
                 var time = item.time();
                 var exchange = HttpRequestResponse.httpRequestResponse(request, ProxyMessages.response(item));
                 return record(exchange, item.annotations(), time == null ? 0 : time.toInstant().toEpochMilli(),
-                        source, item.listenerPort(), prefix);
+                        source, item.listenerPort(), profile);
             });
             case SITE_MAP -> api.siteMap().requestResponses().stream()
-                    .map(exchange -> record(exchange, exchange.annotations(), 0, source, 0, prefix));
+                    .map(exchange -> record(exchange, exchange.annotations(), 0, source, 0, profile));
             case FINDINGS -> api.siteMap().issues().stream().flatMap(issue -> issue.requestResponses().stream())
-                    .map(exchange -> record(exchange, exchange.annotations(), 0, source, 0, prefix));
-            case ORGANIZER -> organizerItems().map(exchange -> record(exchange, exchange.annotations(), 0, source, 0, prefix));
+                    .map(exchange -> record(exchange, exchange.annotations(), 0, source, 0, profile));
+            case ORGANIZER -> organizerItems().map(exchange -> record(exchange, exchange.annotations(), 0, source, 0, profile));
             default -> Stream.empty();
         };
     }
@@ -116,13 +128,10 @@ final class TrafficCatalog {
     }
 
     static CapturedEntry record(HttpRequestResponse exchange, Annotations annotations, long time,
-                                TrafficSource source, int listener, String prefix) {
+                                TrafficSource source, int listener, CaptureProfile profile) {
         if (exchange == null || exchange.request() == null || exchange.request().httpService() == null) return null;
         String notes = annotations == null ? null : annotations.notes();
-        String marker = prefix + ": ";
-        String label = notes == null || notes.isEmpty() ? "" : notes.lines()
-                .filter(line -> line.startsWith(marker)).reduce((first, last) -> last)
-                .map(line -> line.substring(marker.length())).orElse("");
+        String label = UserLabeler.readNote(notes, profile);
         boolean annotated = annotations != null && ((notes != null && !notes.isBlank()) || annotations.hasHighlightColor());
         return CapturedEntry.of(label, exchange, time, source, listener, annotated);
     }

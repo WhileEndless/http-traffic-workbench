@@ -27,8 +27,8 @@ final class ExtractDialog extends JDialog {
     }
 
     record SelectedExchange(HttpRequestResponse exchange, TrafficSource source) {
-        CapturedEntry entry(String prefix) {
-            return TrafficCatalog.record(exchange, exchange.annotations(), 0, source, 0, prefix);
+        CapturedEntry entry(CaptureProfile profile) {
+            return TrafficCatalog.record(exchange, exchange.annotations(), 0, source, 0, profile);
         }
     }
 

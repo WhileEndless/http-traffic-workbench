@@ -1,5 +1,12 @@
 # Release notes
 
+## 1.0.2
+
+- Fix selection-based searches in formatted HTTP editors by reading the selected text directly and preserving line breaks in the search term.
+- Show user labels from existing Proxy history notes that use the saved identifier field or header name. Prefer native Proxy annotations when the selected exchange is already in history.
+- Keep existing labels when applying a preview. Report conflicting labels and failed writes, and allow retries without duplicating successful writes.
+- Prevent failed or ambiguous logins from starting a tracked session. Respect cookie expiration and response timing when carrying labels across requests.
+
 ## 1.0.1
 
 - Illustrate how a selected value leads to exact matches and comparable values in captured traffic.

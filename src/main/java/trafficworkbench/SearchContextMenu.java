@@ -1,6 +1,8 @@
 package trafficworkbench;
 
 import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.core.Range;
+import burp.api.montoya.http.message.HttpMessage;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.core.ToolType;
 import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
@@ -10,7 +12,12 @@ import burp.api.montoya.ui.contextmenu.MessageEditorHttpRequestResponse;
 
 import javax.swing.JMenuItem;
 import javax.swing.SwingUtilities;
+import javax.swing.text.JTextComponent;
 import java.awt.Component;
+import java.awt.Container;
+import java.awt.KeyboardFocusManager;
+import java.awt.event.InputEvent;
+import java.awt.event.MouseEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.nio.charset.StandardCharsets;
@@ -21,6 +28,8 @@ import java.util.Set;
 import java.util.function.Supplier;
 
 final class SearchContextMenu implements ContextMenuItemsProvider {
+    private static final int SELECTION_LIMIT = 8192;
+
     private final MontoyaApi api;
     private final CollectorStore store;
     private final Supplier<CaptureProfile> profile;
@@ -56,15 +65,7 @@ final class SearchContextMenu implements ContextMenuItemsProvider {
                 path = CapturedEntry.endpoint(exchange.request());
             }
             source = () -> HttpSearchFields.collect(exchange, request);
-            var range = editor.selectionOffsets().orElse(null);
-            if (range != null && message != null && range.startIndexInclusive() >= 0
-                    && range.endIndexExclusive() - range.startIndexInclusive() <= 8192) {
-                var bytes = message.toByteArray();
-                if (range.endIndexExclusive() <= bytes.length()) {
-                    selection = clean(new String(bytes.subArray(range.startIndexInclusive(), range.endIndexExclusive())
-                            .getBytes(), StandardCharsets.UTF_8));
-                }
-            }
+            selection = editorSelection(event.inputEvent(), message, editor.selectionOffsets().orElse(null));
         } else if (!messages.isEmpty()) {
             var exchange = messages.get(0);
             anchor = exchange;
@@ -125,7 +126,7 @@ final class SearchContextMenu implements ContextMenuItemsProvider {
 
     private void archive(List<HttpRequestResponse> selected,
                          List<burp.api.montoya.scanner.audit.issues.AuditIssue> issues, TrafficSource origin) {
-        String prefix = profile.get().notePrefix();
+        var currentProfile = profile.get();
         var worker = new javax.swing.SwingWorker<Void, Void>() {
             @Override protected Void doInBackground() {
                 long time = System.currentTimeMillis();
@@ -133,7 +134,7 @@ final class SearchContextMenu implements ContextMenuItemsProvider {
                 var records = java.util.stream.Stream.concat(selected.stream(), evidence)
                         .filter(java.util.Objects::nonNull)
                         .limit(2_000)
-                        .map(exchange -> TrafficCatalog.record(exchange, exchange.annotations(), time, origin, 0, prefix))
+                        .map(exchange -> TrafficCatalog.record(exchange, exchange.annotations(), time, origin, 0, currentProfile))
                         .filter(java.util.Objects::nonNull).toList();
                 int accepted = store.addAll(records);
                 api.logging().logToOutput(accepted + " selected messages added to the traffic archive.");
@@ -195,7 +196,38 @@ final class SearchContextMenu implements ContextMenuItemsProvider {
         });
     }
 
-    static String clean(String selection) {
+    static String editorSelection(InputEvent event, HttpMessage message, Range range) {
+        // Pretty views can report positions in displayed text, which do not index the raw HTTP bytes.
+        var editor = textEditor(event);
+        if (editor != null) {
+            int length = editor.getSelectionEnd() - editor.getSelectionStart();
+            if (length <= 0 || length > SELECTION_LIMIT) return "";
+            String selected = editor.getSelectedText();
+            return selected == null ? "" : clean(selected);
+        }
+        if (message == null || range == null) return "";
+        int start = range.startIndexInclusive();
+        int end = range.endIndexExclusive();
+        if (start < 0 || end <= start || end - start > SELECTION_LIMIT) return "";
+        var bytes = message.toByteArray();
+        return end > bytes.length() ? ""
+                : clean(new String(bytes.subArray(start, end).getBytes(), StandardCharsets.UTF_8));
+    }
+
+    private static JTextComponent textEditor(InputEvent event) {
+        if (event == null) return null;
+        Component source = event.getComponent();
+        if (source instanceof JTextComponent text) return text;
+        if (!(source instanceof Container container)) return null;
+        if (event instanceof MouseEvent mouse) {
+            var clicked = SwingUtilities.getDeepestComponentAt(container, mouse.getX(), mouse.getY());
+            return clicked instanceof JTextComponent text ? text : null;
+        }
+        var focused = KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner();
+        return focused instanceof JTextComponent text && SwingUtilities.isDescendingFrom(text, container) ? text : null;
+    }
+
+    private static String clean(String selection) {
         String text = selection.strip();
         if ((text.startsWith("\"") || text.startsWith("'")) && text.endsWith(":")) {
             text = text.substring(0, text.length() - 1).stripTrailing();

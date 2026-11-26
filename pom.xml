@@ -5,13 +5,13 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>trafficworkbench</groupId>
     <artifactId>http-traffic-workbench</artifactId>
-    <version>1.0.1</version>
+    <version>1.0.2</version>
     <packaging>jar</packaging>
 
     <properties>
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <project.build.outputTimestamp>2026-11-24T00:00:00Z</project.build.outputTimestamp>
+        <project.build.outputTimestamp>2026-11-26T00:00:00Z</project.build.outputTimestamp>
     </properties>
 
     <build>

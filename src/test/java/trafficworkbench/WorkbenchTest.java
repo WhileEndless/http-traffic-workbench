@@ -184,7 +184,7 @@ final class WorkbenchTest {
         var res = response("<root><userId>response-777</userId></root>", "application/xml", Map.of());
         assertEquals("response-777", labeler.label(profile.compile(), req, res, 4096));
         assertEquals("req-777", labeler.label(profile(CaptureProfile.Source.REQUEST_FIRST, "userId").compile(), req, res, 4096));
-        assertEquals("req-777", labeler.label(profile.compile(), req, null, 4096));
+        assertEquals("", labeler.label(profile.compile(), req, null, 4096));
         assertEquals("", profile.compile().identify(new Util.MessageText("userId=a&userId=b", null, null, StandardCharsets.UTF_8)));
         assertEquals("", profile.compile().identify(new Util.MessageText(
                 "{\"userId\":\"a\",\"userId\":\"b\"}", null, null, StandardCharsets.UTF_8)));
@@ -246,12 +246,12 @@ final class WorkbenchTest {
         assertEquals(3, plan.changes().size());
         assertEquals(1, plan.distinctUsers());
         assertEquals("existing text", active.annotations().notes());
-        assertEquals(3, HistoryLabeler.apply(plan, () -> false, ignored -> {}));
+        assertEquals(3, HistoryLabeler.apply(plan, () -> false, ignored -> {}).added());
         assertEquals("existing text\nUser: " + USER, active.annotations().notes());
         assertEquals("manual note\nUser: " + USER, login.annotations().notes());
         assertEquals("", after.annotations().notes());
         assertEquals("", otherHost.annotations().notes());
-        assertEquals(0, HistoryLabeler.apply(plan, () -> false, ignored -> {}));
+        assertEquals(0, HistoryLabeler.apply(plan, () -> false, ignored -> {}).added());
         assertEquals(0, HistoryLabeler.plan(input, profile, () -> true, ignored -> {}).scanned());
     }
 
@@ -275,7 +275,7 @@ final class WorkbenchTest {
         var sample = List.of(login, otherLogin, wrongMethod, otherAction, rejected, notConfirmed, incomplete,
                 stillActive, confirmed, after, other, loginAgain, afterLogin);
         var plan = HistoryLabeler.plan(sample, settings.compile(), () -> false, ignored -> {});
-        assertEquals(sample.size() - 1, HistoryLabeler.apply(plan, () -> false, ignored -> {}));
+        assertEquals(sample.size() - 1, HistoryLabeler.apply(plan, () -> false, ignored -> {}).added());
         assertEquals("User: " + USER, stillActive.annotations().notes());
         assertEquals("User: " + USER, confirmed.annotations().notes());
         assertEquals("", after.annotations().notes());
@@ -332,6 +332,164 @@ final class WorkbenchTest {
         assertEquals("", old.annotations().notes());
         assertEquals("", expired.annotations().notes());
         assertEquals("User: " + USER, next.annotations().notes());
+    }
+
+    @Test
+    void applyKeepsExistingSelectedFieldLabelsAndRetriesIndividualWriteFailures() {
+        var loginRequest = request("POST", LOGIN, "", null, Map.of(), HOST);
+        var login = history(loginRequest, response("{\"identifierTag\":\"" + USER + "\"}", "application/json",
+                Map.of("Set-Cookie", "sid=s1")), "identifierTag: " + USER, TIME);
+        var changed = history("GET", "/edited", "s1", null, "", TIME + 1, HOST);
+        var failOnce = new java.util.concurrent.atomic.AtomicBoolean(true);
+        var notes = new AtomicReference<>("manual");
+        var unstable = mock(Annotations.class, (name, args) -> switch (name) {
+            case "notes" -> notes.get();
+            case "setNotes" -> {
+                if (failOnce.getAndSet(false)) throw new IllegalStateException("Synthetic write failure");
+                notes.set((String) args[0]);
+                yield null;
+            }
+            default -> null;
+        });
+        var request = request("GET", "/retry", "", null, Map.of(COOKIE, "s1"), HOST);
+        var retry = history(request, null, unstable, TIME + 2, 0);
+        var ordinary = history("GET", "/done", "s1", null, "manual", TIME + 3, HOST);
+        var profile = profile(CaptureProfile.Source.RESPONSE, "identifierTag").compile();
+        var plan = HistoryLabeler.plan(List.of(login, retry, ordinary, changed), profile, () -> false, ignored -> {});
+        assertEquals(1, plan.existing());
+        assertEquals(3, plan.changes().size());
+        assertEquals("manual", ordinary.annotations().notes());
+
+        changed.annotations().setNotes("  identifiertagBackup: ignored\nidentifierTag : different-owner");
+        assertEquals(new HistoryLabeler.ApplyResult(1, 1, 1, 1), HistoryLabeler.apply(plan, () -> false, ignored -> {}));
+        assertEquals("manual\nUser: " + USER, ordinary.annotations().notes());
+        assertEquals("manual", notes.get());
+        assertEquals(new HistoryLabeler.ApplyResult(1, 2, 1, 0), HistoryLabeler.apply(plan, () -> false, ignored -> {}));
+        assertEquals("manual\nUser: " + USER, notes.get());
+        assertEquals("identifierTag: " + USER, login.annotations().notes());
+        assertTrue(changed.annotations().notes().endsWith("different-owner"));
+    }
+
+    @Test
+    void replayWaitsForTheLoginResponseAndStopsAtCookieMaxAge() {
+        var request = request("POST", LOGIN, "", null, Map.of(COOKIE, "s1"), HOST);
+        var answer = response("{\"userId\":\"" + USER + "\"}", "application/json",
+                Map.of("Set-Cookie", "sid=s1; Max-Age=2"));
+        var login = history(request, answer, annotations(""), TIME, 100);
+        var early = history("GET", "/early", "s1", null, "", TIME + 50, HOST);
+        var active = history("GET", "/active", "s1", null, "", TIME + 2_099, HOST);
+        var expired = history("GET", "/expired", "s1", null, "", TIME + 2_100, HOST);
+        var plan = HistoryLabeler.plan(List.of(expired, early, active, login),
+                profile(CaptureProfile.Source.RESPONSE, "userId").compile(), () -> false, ignored -> {});
+        assertEquals(List.of(LOGIN, "/active"), plan.sample().stream().map(example -> java.net.URI.create(example.url()).getPath()).toList());
+    }
+
+    @Test
+    void replayDoesNotInheritBeforeAResponseWithinTheSameMillisecond() {
+        var request = request("POST", LOGIN, "", null, Map.of(COOKIE, "s1"), HOST);
+        var answer = response("{\"userId\":\"demo-user\"}", "application/json", Map.of());
+        var login = history(request, answer, annotations(""), TIME, java.time.Duration.ofNanos(500_000));
+        var beforeResponse = history("GET", "/early", "s1", null, "", TIME, HOST);
+        var afterResponse = history("GET", "/later", "s1", null, "", TIME + 1, HOST);
+        var profile = profile(CaptureProfile.Source.RESPONSE, "userId").compile();
+        var plan = HistoryLabeler.plan(List.of(login, beforeResponse, afterResponse), profile, () -> false, ignored -> {});
+        assertEquals(2, HistoryLabeler.apply(plan, () -> false, ignored -> {}).added());
+        assertEquals("", beforeResponse.annotations().notes());
+        assertEquals("User: demo-user", afterResponse.annotations().notes());
+    }
+
+    @Test
+    void replaySkipsUndatedAndConflictingOverlappingExchanges() {
+        var request = request("POST", LOGIN, "", null, Map.of(COOKIE, "s1"), HOST);
+        var oldResponse = response("{\"userId\":\"demo-old\"}", "application/json", Map.of());
+        var newResponse = response("{\"userId\":\"demo-new\"}", "application/json", Map.of());
+        var first = history(request, oldResponse, annotations(""), TIME, 100);
+        var overlapping = history(request, newResponse, annotations(""), TIME + 10, 20);
+        var later = history("GET", "/later", "s1", null, "", TIME + 150, HOST);
+        var recovered = history(request, newResponse, "", TIME + 200);
+        var afterRecovery = history("GET", "/after", "s1", null, "", TIME + 250, HOST);
+        var noTime = mock(ProxyHttpRequestResponse.class, (name, args) -> switch (name) {
+            case "request", "finalRequest" -> request;
+            case "response" -> newResponse;
+            default -> null;
+        });
+        var profile = profile(CaptureProfile.Source.RESPONSE, "userId").compile();
+        var plan = HistoryLabeler.plan(List.of(later, noTime, overlapping, first, afterRecovery, recovered),
+                profile, () -> false, ignored -> {});
+        assertEquals(1, plan.undated());
+        assertEquals(4, HistoryLabeler.apply(plan, () -> false, ignored -> {}).added());
+        assertEquals("", later.annotations().notes());
+        assertEquals("User: demo-new", afterRecovery.annotations().notes());
+        assertThrows(IllegalArgumentException.class,
+                () -> HistoryLabeler.plan(List.of(noTime), profile, noTime, () -> false, ignored -> {}));
+    }
+
+    @Test
+    void historicalApplyCanContinueAfterCancellationAndPreviewLimit() {
+        var login = history("POST", LOGIN, "", USER, "", TIME, HOST);
+        var activity = request("GET", "/activity", "", null, Map.of(COOKIE, "s1"), HOST);
+        var history = new ArrayList<ProxyHttpRequestResponse>();
+        history.add(login);
+        for (int i = 0; i < 25_000; i++) history.add(history(activity, null, "", TIME + i + 1));
+        var profile = profile(CaptureProfile.Source.RESPONSE, "userId").compile();
+        var plan = HistoryLabeler.plan(history, profile, () -> false, ignored -> {});
+        assertTrue(plan.limited());
+        assertEquals(25_000, plan.changes().size());
+        assertEquals(50, plan.sample().size());
+        var remaining = new AtomicInteger(1);
+        assertEquals(1, HistoryLabeler.apply(plan, () -> remaining.getAndDecrement() <= 0, ignored -> {}).added());
+        assertEquals(new HistoryLabeler.ApplyResult(24_999, 1, 0, 0),
+                HistoryLabeler.apply(plan, () -> false, ignored -> {}));
+        var next = HistoryLabeler.plan(history, profile, () -> false, ignored -> {});
+        assertFalse(next.limited());
+        assertEquals(25_000, next.existing());
+        assertEquals(1, HistoryLabeler.apply(next, () -> false, ignored -> {}).added());
+    }
+
+    @Test
+    void failedOrAmbiguousLoginCannotSeedHistoricalSession() {
+        var request = request("POST", LOGIN, "userId=synthetic", "application/x-www-form-urlencoded", Map.of(COOKIE, "s1"), HOST);
+        var failure = history(request, response(new byte[0], null, Map.of(), 403), "", TIME);
+        var ambiguousRequest = request("POST", LOGIN, "userId=synthetic", "application/x-www-form-urlencoded",
+                Map.of(COOKIE, "s1; sid=s2"), HOST);
+        var ambiguous = history(ambiguousRequest, response("", null, Map.of()), "", TIME + 1);
+        var activity = history("GET", "/activity", "s1", null, "", TIME + 2, HOST);
+        var profile = profile(CaptureProfile.Source.REQUEST, "userId").compile();
+        var records = List.of(failure, ambiguous, activity);
+        assertThrows(IllegalArgumentException.class, () -> HistoryLabeler.plan(records, profile, failure, () -> false, ignored -> {}));
+        assertThrows(IllegalArgumentException.class, () -> HistoryLabeler.plan(records, profile, ambiguous, () -> false, ignored -> {}));
+        var plan = HistoryLabeler.plan(records, profile, () -> false, ignored -> {});
+        assertEquals(1, HistoryLabeler.apply(plan, () -> false, ignored -> {}).added());
+        assertEquals("", activity.annotations().notes());
+        assertEquals("", failure.annotations().notes());
+    }
+
+    @Test
+    void lateResponseCannotInheritANewerUserOfTheSameCookie() {
+        var login = request("POST", LOGIN, "", null, Map.of(COOKIE, "s1"), HOST);
+        var activity = request("GET", "/activity", "", null, Map.of(COOKIE, "s1"), HOST);
+        var oldUser = response("{\"userId\":\"demo-old\"}", "application/json", Map.of());
+        var newUser = response("{\"userId\":\"demo-new\"}", "application/json", Map.of());
+        var answer = response("", null, Map.of());
+        var profile = profile(CaptureProfile.Source.RESPONSE, "userId").compile();
+        var labeler = new UserLabeler();
+        assertEquals("demo-old", labeler.label(profile, login, oldUser, 4096, TIME, TIME + 1, true));
+        assertEquals("demo-new", labeler.label(profile, login, newUser, 4096, TIME + 3, TIME + 4, true));
+        assertEquals("", labeler.label(profile, activity, answer, 4096, TIME + 2, TIME + 5, true));
+        assertEquals("demo-new", labeler.label(profile, activity, answer, 4096, TIME + 6, TIME + 7, true));
+    }
+
+    @Test
+    void rotationCannotMergeTwoCookiesWithConflictingActiveIdentities() {
+        var first = history("POST", LOGIN, "", "demo-first", "", TIME, HOST);
+        var second = history("POST", LOGIN, "", "demo-second", "", TIME + 1, HOST, "sid=s2");
+        var rotate = history("GET", "/rotate", "s1", null, "", TIME + 2, HOST, "sid=s2");
+        var after = history("GET", "/account", "s2", null, "", TIME + 3, HOST);
+        var settings = profile(CaptureProfile.Source.RESPONSE, "userId").compile();
+        var plan = HistoryLabeler.plan(List.of(first, second, rotate, after), settings, () -> false, ignored -> {});
+        assertEquals(3, HistoryLabeler.apply(plan, () -> false, ignored -> {}).added());
+        assertEquals("User: demo-first", rotate.annotations().notes());
+        assertEquals("", after.annotations().notes());
     }
 
     @Test
@@ -617,6 +775,97 @@ final class WorkbenchTest {
     }
 
     @Test
+    void formattedResponseSelectionUsesDisplayedTextInsteadOfRawOffsets() throws Exception {
+        String value = "ref-α ** [x] 91";
+        String compact = "{\"details\":[{\"label\":\"" + value + "\"}],\"tail\":\"" + "placeholder".repeat(5) + "\"}";
+        var answer = response(compact, "application/json", Map.of());
+        var exchange = exchange(request("GET", "/preview", "", null, Map.of(), HOST), answer);
+        String raw = new String(answer.toByteArray().getBytes(), StandardCharsets.UTF_8);
+        String displayed = raw.replace(compact, """
+                {
+                    "details": [
+                        {
+                            "label": "%s"
+                        }
+                    ]
+                }
+                """.formatted(value));
+        int start = displayed.indexOf(value);
+        var offsets = mock(burp.api.montoya.core.Range.class, (name, args) ->
+                name.equals("startIndexInclusive") ? start : start + value.length());
+        String rawFragment = SearchContextMenu.editorSelection(null, answer, offsets);
+        assertFalse(rawFragment.isEmpty());
+        assertNotEquals(value, rawFragment);
+
+        var selection = new AtomicReference<String>();
+        javax.swing.SwingUtilities.invokeAndWait(() -> {
+            var editor = new javax.swing.JTextArea(displayed);
+            editor.select(start, start + value.length());
+            var click = new java.awt.event.MouseEvent(editor, java.awt.event.MouseEvent.MOUSE_RELEASED,
+                    0, 0, 0, 0, 1, true, java.awt.event.MouseEvent.BUTTON3);
+            selection.set(SearchContextMenu.editorSelection(click, answer, offsets));
+            assertEquals(value, SearchContextMenu.editorSelection(click, answer, null));
+            var editorContainer = new javax.swing.JPanel(null);
+            editorContainer.setSize(100, 100);
+            editor.setBounds(0, 0, 100, 100);
+            editorContainer.add(editor);
+            var containerClick = new java.awt.event.MouseEvent(editorContainer, java.awt.event.MouseEvent.MOUSE_RELEASED,
+                    0, 0, 10, 10, 1, true, java.awt.event.MouseEvent.BUTTON3);
+            assertEquals(value, SearchContextMenu.editorSelection(containerClick, answer, offsets));
+            editor.select(start, start);
+            assertEquals("", SearchContextMenu.editorSelection(click, answer, offsets));
+        });
+        assertEquals(value, selection.get());
+        var rows = new ArrayList<ResultRow>();
+        new ExtractEngine(List.of(CapturedEntry.of("", exchange)), "", 0, false, ExtractEngine.Direction.BOTH,
+                true, false, sink(rows)).runAutoFromContext(selection.get(), HttpSearchFields.collect(exchange, false), false);
+        assertEquals(1, rows.size());
+        assertEquals("Response", rows.get(0).source);
+        assertEquals("label", rows.get(0).key);
+        assertEquals(value, rows.get(0).editorSearch);
+    }
+
+    @Test
+    void searchPanelUsesOriginalLineBreaksFromEditorSelection() throws Exception {
+        String selection = "demo one\n  demo two";
+        var request = request("GET", "/preview", "", null, Map.of(), HOST);
+        var exchange = exchange(request, response(selection, "text/plain", Map.of()));
+        var store = new CollectorStore(persistence());
+        var scans = new ScanQueue();
+        var completed = new java.util.concurrent.CountDownLatch(1);
+        var panel = new AtomicReference<SearchPanel>();
+        try {
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                var ui = offscreenUi();
+                var api = mock(MontoyaApi.class, (name, args) -> ui);
+                var context = new ExtractDialog.Context(selection, CapturedEntry.endpoint(request), List::of, null,
+                        new ExtractDialog.SelectedExchange(exchange, TrafficSource.REPEATER));
+                var search = new SearchPanel(api, store, scans, CaptureProfile::defaults,
+                        ExtractDialog.Dataset.ALL, context, () -> {});
+                panel.set(search);
+                find(search, SourcePicker.class).select(Set.of(TrafficSource.REPEATER));
+                button(search, "Stop").addPropertyChangeListener("enabled", event -> {
+                    if (Boolean.FALSE.equals(event.getNewValue())) completed.countDown();
+                });
+                search.searchSelection();
+            });
+            assertTrue(completed.await(3, java.util.concurrent.TimeUnit.SECONDS));
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                var table = find(panel.get(), javax.swing.JTable.class);
+                assertEquals(1, table.getRowCount());
+                assertEquals("Response", table.getValueAt(0, 4));
+                assertEquals("Text match · same endpoint", table.getValueAt(0, 7));
+            });
+        } finally {
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                if (panel.get() != null) panel.get().close();
+            });
+            scans.close();
+            store.flushAndShutdown();
+        }
+    }
+
+    @Test
     void completedExchangeUpdatesTheDisplayedFormSpellingOfACollapsedMatch() {
         var incomplete = CapturedEntry.of("", exchange(request("POST", "/submit", "item=part%2f42",
                 "application/x-www-form-urlencoded", Map.of(), HOST), null));
@@ -695,14 +944,15 @@ final class WorkbenchTest {
     }
 
     @Test
-    void selectedProxyExchangeReplacesOneNativeCopyButKeepsOtherHistoryRows() {
+    void selectedProxyExchangeKeepsNativeNotesAndRepeatedHistoryRows() {
         var exchange = exchange(request("POST", "/item", "entry=sample", "application/x-www-form-urlencoded",
                 Map.of(), HOST), null);
         var selected = CapturedEntry.of("", exchange, 0, TrafficSource.PROXY, 0, false);
-        var first = CapturedEntry.of("", exchange, TIME, TrafficSource.PROXY, 8090, false);
+        var first = CapturedEntry.of("demo-owner", exchange, TIME, TrafficSource.PROXY, 8090, true);
         var second = CapturedEntry.of("", exchange, TIME + 1, TrafficSource.PROXY, 8090, false);
-        assertEquals(List.of(selected, second), TrafficCatalog.includeSelected(java.util.stream.Stream.of(first, second),
+        assertEquals(List.of(first, second), TrafficCatalog.includeSelected(java.util.stream.Stream.of(first, second),
                 selected).toList());
+        assertEquals(List.of(selected), TrafficCatalog.includeSelected(java.util.stream.Stream.empty(), selected).toList());
     }
 
     @Test
@@ -1410,12 +1660,61 @@ final class WorkbenchTest {
         var api = mock(MontoyaApi.class, (name, args) -> proxy);
         var store = new CollectorStore(persistence());
         try {
-            var entry = new TrafficCatalog(api, store).stream(Set.of(TrafficSource.PROXY), "User").findFirst().orElseThrow();
+            var entry = new TrafficCatalog(api, store).stream(Set.of(TrafficSource.PROXY), CaptureProfile.defaults())
+                    .findFirst().orElseThrow();
             assertSame(answer, entry.requestResponse().response());
             var chosen = new SessionAnchor(exchange(request, null), CaptureProfile.Source.REQUEST, "original-user")
                     .resolve(List.of(record), () -> false);
             assertSame(record, chosen.item());
             assertSame(answer, chosen.exchange().response());
+        } finally {
+            store.flushAndShutdown();
+        }
+    }
+
+    @Test
+    void searchResultsReadUserLabelsFromProxyHistoryNotes() {
+        var request = request("GET", "/item?entry=sample", "", null, Map.of(), HOST);
+        var history = List.of(
+                history(request, null, "Review later\r\n  User Code : U77  ", TIME),
+                history(request, null, "UserCode:U78", TIME + 1),
+                history(request, null, "user : U79\nUser Code: previous\nUser: ", TIME + 2),
+                history(request, null, "User agent: browser", TIME + 3));
+        var proxy = mock(burp.api.montoya.proxy.Proxy.class, (name, args) -> history);
+        var api = mock(MontoyaApi.class, (name, args) -> proxy);
+        var store = new CollectorStore(persistence());
+        try {
+            var records = new TrafficCatalog(api, store).stream(Set.of(TrafficSource.PROXY), CaptureProfile.defaults()).toList();
+            var rows = new ArrayList<ResultRow>();
+            new ExtractEngine(records, "", 0, false, ExtractEngine.Direction.REQUEST, false, false, sink(rows))
+                    .runKey(List.of("entry"));
+            assertEquals(List.of("U77", "U78", "U79", ""), rows.stream().map(row -> row.userCode).toList());
+        } finally {
+            store.flushAndShutdown();
+        }
+    }
+
+    @Test
+    void searchUsesTheSavedIdentifierFieldToReadExistingHistoryNotes() throws Exception {
+        var request = request("GET", "/item?entry=sample", "", null, Map.of(), HOST);
+        String notes = "reviewTag: ignored\naccountLabelBackup: ignored\naccountLabel: 000741\nmemberReference: M-82";
+        var record = history(request, null, notes, TIME);
+        var proxy = mock(burp.api.montoya.proxy.Proxy.class, (name, args) -> List.of(record));
+        var api = mock(MontoyaApi.class, (name, args) -> proxy);
+        var persistence = persistence();
+        var store = new CollectorStore(persistence);
+        try {
+            var catalog = new TrafficCatalog(api, store);
+            for (var choice : Map.of("accountLabel", "000741", "memberReference", "M-82", "otherIdentifier", "").entrySet()) {
+                persistence.saveProfile(profile(CaptureProfile.Source.RESPONSE, choice.getKey()));
+                var saved = persistence.loadProfile();
+                var records = catalog.stream(Set.of(TrafficSource.PROXY), saved).toList();
+                var rows = new ArrayList<ResultRow>();
+                new ExtractEngine(records, "", 0, false, ExtractEngine.Direction.REQUEST, false, false, sink(rows))
+                        .runKey(List.of("entry"));
+                assertEquals(List.of(choice.getValue()), rows.stream().map(row -> row.userCode).toList());
+            }
+            assertEquals(notes, record.annotations().notes());
         } finally {
             store.flushAndShutdown();
         }
@@ -1470,7 +1769,7 @@ final class WorkbenchTest {
         var history = List.of(otherActivity, selected, priorLogin, selectedActivity, otherLogin, priorActivity,
                 laterLogin, laterActivity);
         var plan = HistoryLabeler.plan(history, rule, selected, () -> false, ignored -> {});
-        assertEquals(2, HistoryLabeler.apply(plan, () -> false, ignored -> {}));
+        assertEquals(2, HistoryLabeler.apply(plan, () -> false, ignored -> {}).added());
         assertEquals("User: " + USER, selected.annotations().notes());
         assertEquals("User: " + USER, selectedActivity.annotations().notes());
         for (var untouched : List.of(priorLogin, priorActivity, otherLogin, otherActivity, laterLogin, laterActivity)) {
@@ -1760,14 +2059,14 @@ final class WorkbenchTest {
                     TrafficSource.EXTENSIONS);
             assertEquals(List.of(TrafficSource.PROXY, TrafficSource.SITE_MAP, TrafficSource.FINDINGS,
                             TrafficSource.EXTENSIONS),
-                    catalog.stream(enabled, "User").map(CapturedEntry::source).toList());
+                    catalog.stream(enabled, CaptureProfile.defaults()).map(CapturedEntry::source).toList());
             var filters = TrafficFilters.create("app.example.test", false, true, false, false,
                     "POST", "2xx", "json", ".json", "");
-            assertEquals(3, catalog.stream(enabled, "User").filter(filters::matches).count());
+            assertEquals(3, catalog.stream(enabled, CaptureProfile.defaults()).filter(filters::matches).count());
             var listenerFilter = TrafficFilters.create("", false, true, false, true,
                     "GET", "200", "", "", "8080");
-            assertEquals(1, catalog.stream(enabled, "User").filter(listenerFilter::matches).count());
-            var records = catalog.stream(Set.of(TrafficSource.SCANNER, TrafficSource.PROXY), "User").toList();
+            assertEquals(1, catalog.stream(enabled, CaptureProfile.defaults()).filter(listenerFilter::matches).count());
+            var records = catalog.stream(Set.of(TrafficSource.SCANNER, TrafficSource.PROXY), CaptureProfile.defaults()).toList();
             var results = new ArrayList<ResultRow>();
             var engine = new ExtractEngine(records, "", 0, false, ExtractEngine.Direction.BOTH, false, false, sink(results));
             engine.runText(TimedRegex.compile("remote\\s+response"), true, true);
@@ -1849,7 +2148,7 @@ final class WorkbenchTest {
                     assertTrue(button(component, "Project settings…").isEnabled());
                     assertTrue(button(component, "Trace a cookie…").isEnabled());
                     assertTrue(button(component, "Info").isEnabled());
-                    assertEquals("v1.0.1", BuildInfo.release());
+                    assertEquals("v1.0.2", BuildInfo.release());
                     render(component, 1050, 700, "archive");
                 } finally {
                     tab.close();
@@ -1934,7 +2233,7 @@ final class WorkbenchTest {
                     render(info, preferred.width, preferred.height, "info");
                     assertTrue(hasLabel(info, "WhileEndless"));
                     assertTrue(hasLabel(info, "http-traffic-workbench"));
-                    assertTrue(hasLabel(info, "Version v1.0.1"));
+                    assertTrue(hasLabel(info, "Version v1.0.2"));
                     assertNotNull(button(info, "Open repository"));
                     assertNotNull(button(info, "Copy repository URL"));
 
@@ -2107,14 +2406,26 @@ final class WorkbenchTest {
     }
 
     private static ProxyHttpRequestResponse history(HttpRequest request, HttpResponse response, String notes, long time) {
-        var annotations = annotations(notes);
+        return history(request, response, annotations(notes), time, 0);
+    }
+
+    private static ProxyHttpRequestResponse history(HttpRequest request, HttpResponse response, Annotations annotations,
+                                                    long time, long responseDelay) {
+        return history(request, response, annotations, time, java.time.Duration.ofMillis(responseDelay));
+    }
+
+    private static ProxyHttpRequestResponse history(HttpRequest request, HttpResponse response, Annotations annotations,
+                                                    long time, java.time.Duration responseDelay) {
         return mock(ProxyHttpRequestResponse.class, (name, args) -> switch (name) {
             case "request", "finalRequest" -> request;
             case "response" -> response;
             case "annotations" -> annotations;
             case "listenerPort" -> 8080;
-            case "timingData" -> mock(burp.api.montoya.http.handler.TimingData.class, (methodName, unused) ->
-                    Instant.ofEpochMilli(time).atZone(ZoneOffset.UTC));
+            case "timingData" -> mock(burp.api.montoya.http.handler.TimingData.class, (methodName, unused) -> switch (methodName) {
+                case "timeRequestSent" -> Instant.ofEpochMilli(time).atZone(ZoneOffset.UTC);
+                case "timeBetweenRequestSentAndEndOfResponse" -> responseDelay;
+                default -> null;
+            });
             case "time" -> Instant.ofEpochMilli(time).atZone(ZoneOffset.UTC);
             default -> null;
         });

@@ -14,6 +14,7 @@ import burp.api.montoya.proxy.http.ProxyResponseToBeSentAction;
 
 import javax.swing.SwingUtilities;
 import java.io.IOException;
+import java.util.LinkedHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -102,9 +103,13 @@ public final class TrafficWorkbench implements BurpExtension, ProxyRequestHandle
 
     @Override
     public ProxyRequestToBeSentAction handleRequestToBeSent(InterceptedRequest request) {
-        var profile = runtime.profile;
+        var current = runtime;
+        var profile = current.profile;
         var settings = profile.settings();
         try {
+            if ((settings.annotate() || settings.collect()) && !settings.sessionCookie().isEmpty() && profile.covers(request)) {
+                current.requests.sent(request.messageId(), System.currentTimeMillis());
+            }
             if (settings.annotate() && settings.sessionCookie().isEmpty()
                     && (settings.source() == CaptureProfile.Source.REQUEST
                         || settings.source() == CaptureProfile.Source.REQUEST_FIRST)
@@ -112,7 +117,7 @@ public final class TrafficWorkbench implements BurpExtension, ProxyRequestHandle
                 String label = profile.identify(request, request.query(), LIVE_BODY_LIMIT);
                 if (!label.isEmpty()) {
                     return ProxyRequestToBeSentAction.continueWith(request,
-                            UserLabeler.addNote(request.annotations(), settings.notePrefix(), label));
+                            UserLabeler.addNote(request.annotations(), settings, label));
                 }
             }
         } catch (RuntimeException ex) {
@@ -133,6 +138,8 @@ public final class TrafficWorkbench implements BurpExtension, ProxyRequestHandle
         var request = response.initiatingRequest();
         try {
             var settings = profile.settings();
+            long received = System.currentTimeMillis();
+            Long sent = settings.sessionCookie().isEmpty() ? null : current.requests.completed(response.messageId());
             if ((!settings.collect() && !settings.annotate()) || !profile.covers(request)) {
                 return ProxyResponseToBeSentAction.continueWith(response);
             }
@@ -144,17 +151,17 @@ public final class TrafficWorkbench implements BurpExtension, ProxyRequestHandle
                     && (!settings.successfulOnly() || response.statusCode() >= 200 && response.statusCode() < 400);
             if (!settings.annotate()) {
                 if (archive || !settings.sessionCookie().isEmpty()) {
-                    enqueue(current, response, archive, null);
+                    enqueue(current, response, archive, null, sent, received);
                 }
                 return ProxyResponseToBeSentAction.continueWith(response);
             }
-            String label = current.labeler.label(profile, request, response, LIVE_BODY_LIMIT);
+            String label = liveLabel(current, response, LIVE_BODY_LIMIT, sent, received);
             if (archive) {
-                enqueue(current, response, true, label);
+                enqueue(current, response, true, label, sent, received);
             }
             if (included && !label.isEmpty()) {
                 return ProxyResponseToBeSentAction.continueWith(response,
-                        UserLabeler.addNote(response.annotations(), settings.notePrefix(), label));
+                        UserLabeler.addNote(response.annotations(), settings, label));
             }
         } catch (RuntimeException ex) {
             reportProxyError(ex);
@@ -162,19 +169,25 @@ public final class TrafficWorkbench implements BurpExtension, ProxyRequestHandle
         return ProxyResponseToBeSentAction.continueWith(response);
     }
 
-    private void enqueue(RuntimeProfile current, InterceptedResponse response, boolean archive, String knownLabel) {
-        long time = System.currentTimeMillis();
+    private String liveLabel(RuntimeProfile current, InterceptedResponse response, int limit, Long sent, long received) {
+        // Without a send time, the response can establish its own login but cannot inherit a recorded session.
+        long time = sent == null ? Long.MIN_VALUE : sent;
+        return current.labeler.label(current.profile, response.initiatingRequest(), response, limit, time,
+                Math.max(time, received), true);
+    }
+
+    private void enqueue(RuntimeProfile current, InterceptedResponse response, boolean archive, String knownLabel,
+                         Long sent, long received) {
         capture.execute(() -> {
             if (runtime != current) return;
             try {
                 var request = response.initiatingRequest();
-                String label = knownLabel == null ? current.labeler.label(current.profile, request, response,
-                        Util.MAX_BODY_BYTES) : knownLabel;
+                String label = knownLabel == null ? liveLabel(current, response, Util.MAX_BODY_BYTES, sent, received) : knownLabel;
                 if (archive) {
                     var annotations = response.annotations();
                     boolean annotated = current.profile.settings().annotate() && !label.isEmpty()
                             || annotations != null && (annotations.hasNotes() || annotations.hasHighlightColor());
-                    store.add(CapturedEntry.of(label, HttpRequestResponse.httpRequestResponse(request, response), time,
+                    store.add(CapturedEntry.of(label, HttpRequestResponse.httpRequestResponse(request, response), received,
                             TrafficSource.ARCHIVE, 0, annotated));
                 }
             } catch (RuntimeException ex) {
@@ -187,5 +200,23 @@ public final class TrafficWorkbench implements BurpExtension, ProxyRequestHandle
         api.logging().logToError(NAME + " · Could not process an HTTP record (" + error.getClass().getSimpleName() + ").");
     }
 
-    private record RuntimeProfile(CaptureProfile.Compiled profile, UserLabeler labeler) {}
+    private record RuntimeProfile(CaptureProfile.Compiled profile, UserLabeler labeler, RequestTimes requests) {
+        RuntimeProfile(CaptureProfile.Compiled profile, UserLabeler labeler) {
+            this(profile, labeler, new RequestTimes());
+        }
+    }
+
+    private static final class RequestTimes {
+        private static final int LIMIT = 4_096;
+        private final LinkedHashMap<Integer, Long> sent = new LinkedHashMap<>();
+
+        synchronized void sent(int id, long time) {
+            sent.put(id, time);
+            if (sent.size() > LIMIT) sent.remove(sent.keySet().iterator().next());
+        }
+
+        synchronized Long completed(int id) {
+            return sent.remove(id);
+        }
+    }
 }

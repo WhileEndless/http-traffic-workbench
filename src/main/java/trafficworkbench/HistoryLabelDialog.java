@@ -190,6 +190,7 @@ final class HistoryLabelDialog extends JDialog {
         });
         onlySelected.addActionListener(event -> invalidatePlan());
         scope.addActionListener(event -> invalidatePlan());
+        live.addActionListener(event -> invalidatePlan());
         api.userInterface().applyThemeToComponent(root);
         setContentPane(root);
         pack();
@@ -269,7 +270,7 @@ final class HistoryLabelDialog extends JDialog {
         loadingOptions = true;
         try {
             field.setModel(new DefaultComboBoxModel<>(choices.toArray(String[]::new)));
-            String next = choices.contains(previous) || keepManual && choices.isEmpty()
+            String next = choices.contains(previous) || !suggestions.value(side, previous).isEmpty() || keepManual && choices.isEmpty()
                     ? previous : suggestions.recommendField(side);
             setValue(field, next);
         } finally {
@@ -322,14 +323,6 @@ final class HistoryLabelDialog extends JDialog {
         try {
             var rule = rule().compile();
             boolean selectedOnly = anchor != null && onlySelected.isSelected();
-            if (selectedOnly && suggestions != null) {
-                if (suggestions.value(rule.settings().source(), rule.settings().expression()).isEmpty()) {
-                    throw new IllegalArgumentException("Choose a field that yields one identifier in the selected exchange.");
-                }
-                if (!suggestions.cookies().contains(rule.settings().sessionCookie())) {
-                    throw new IllegalArgumentException("Choose a cookie present in the selected request or response.");
-                }
-            }
             plan = null;
             sample.setRowCount(0);
             work("Scanning Proxy history in chronological order…", true,
@@ -354,7 +347,8 @@ final class HistoryLabelDialog extends JDialog {
                             sample.addRow(new Object[]{item.url(), item.label()});
                         }
                         status.setText(result.scanned() + " records · " + result.distinctUsers() + " users · "
-                                + result.changes().size() + " new notes · " + result.existing() + " existing"
+                                + result.changes().size() + " new notes · " + existingNotes(result.existing(), result.conflicts())
+                                + (result.undated() == 0 ? "" : " · " + result.undated() + " without timestamps skipped")
                                 + (result.limited() ? " · First 25,000 new notes" : ""));
                     });
         } catch (IllegalArgumentException ex) {
@@ -365,13 +359,32 @@ final class HistoryLabelDialog extends JDialog {
     private void apply() {
         var current = plan;
         if (current == null || current.changes().isEmpty()) return;
+        try {
+            if (!rule().equals(current.profile())) {
+                invalidatePlan();
+                return;
+            }
+        } catch (IllegalArgumentException ex) {
+            invalidatePlan();
+            status.setText(ex.getMessage());
+            return;
+        }
         work("Adding notes to Proxy history…", false,
                 update -> HistoryLabeler.apply(current, () -> Thread.currentThread().isInterrupted(), update),
-                count -> {
-                    plan = null;
-                    sample.setRowCount(0);
-                    status.setText(count + " new notes added. Existing notes were kept.");
+                result -> {
+                    if (result.failed() == 0) {
+                        plan = null;
+                        sample.setRowCount(0);
+                    }
+                    status.setText(result.added() + " notes added · "
+                            + existingNotes(current.existing() + result.existing(), current.conflicts() + result.conflicts())
+                            + (result.failed() == 0 ? "" : " · " + result.failed() + " failed. Select Apply notes to retry.")
+                            + (result.failed() == 0 && current.limited() ? " · Preview again for the remaining records." : ""));
                 });
+    }
+
+    private static String existingNotes(int existing, int conflicts) {
+        return existing + " existing labels kept" + (conflicts == 0 ? "" : " (" + conflicts + " differ from this rule)");
     }
 
     private void save() {

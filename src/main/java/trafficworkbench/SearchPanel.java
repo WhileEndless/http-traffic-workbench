@@ -36,6 +36,7 @@ final class SearchPanel extends JPanel {
     private final ScanQueue scans;
     private final Supplier<CaptureProfile> profile;
     private final Context context;
+    private final String initialQuery;
     private final SourcePicker sources;
     private final JComboBox<Mode> mode = new JComboBox<>(new Mode[]{Mode.AUTO, Mode.KEY, Mode.VALUE, Mode.TEXT});
     private final JComboBox<ExtractEngine.Direction> direction = new JComboBox<>(ExtractEngine.Direction.values());
@@ -97,6 +98,7 @@ final class SearchPanel extends JPanel {
         this.scans = scans;
         this.profile = profile;
         this.context = context;
+        initialQuery = context.selection().replace("\r", "\\r").replace("\n", "\\n");
         var selectedRequest = context.selectedExchange() == null ? null : context.selectedExchange().exchange().request();
         setReferenceHost(selectedRequest == null ? null : selectedRequest.httpService());
         sameHost.setVisible(context.cookie() == null);
@@ -106,7 +108,7 @@ final class SearchPanel extends JPanel {
         sources.whenClosed(this::sourcesChanged);
         if (initialDataset == Dataset.ARCHIVE) status.setText("Search saved, imported, or captured traffic.");
         resultFilter.setSelectedItem(ResultPages.Filter.ALL);
-        query.setText(context.selection());
+        query.setText(initialQuery);
         mode.setSelectedItem(Mode.AUTO);
         if (context.cookie() != null) {
             Mode cookieMode = context.cookie().followReplacements() ? Mode.COOKIE_ROTATION : Mode.COOKIE;
@@ -359,7 +361,8 @@ final class SearchPanel extends JPanel {
     }
 
     private void search() {
-        String needle = query.getText().strip();
+        String entered = query.getText();
+        String needle = entered.equals(initialQuery) ? context.selection().strip() : entered.strip();
         if (needle.length() > 8192) {
             status.setText("Search terms can be up to 8,192 characters.");
             return;
@@ -396,7 +399,7 @@ final class SearchPanel extends JPanel {
                 (ExtractEngine.Direction) direction.getSelectedItem(), needle, traffic, caseSensitive.isSelected(),
                 partial.isSelected(), siblings.isSelected(), context.cookie() == null && collapseRepeated.isSelected(),
                 context.cookie() == null ? (Integer) depth.getValue() : 0,
-                profile.get().notePrefix(), sameHost.isEnabled() && sameHost.isSelected() ? referenceHost : "",
+                profile.get(), sameHost.isEnabled() && sameHost.isSelected() ? referenceHost : "",
                 expression, regexSearch, exclude);
         pages.clear();
         showPage(0);
@@ -581,7 +584,7 @@ final class SearchPanel extends JPanel {
 
     private record Options(Set<TrafficSource> sources, Mode mode, ExtractEngine.Direction direction, String needle,
                            TrafficFilters traffic, boolean caseSensitive, boolean partial, boolean siblings,
-                           boolean collapseRepeated, int depth, String notePrefix, String host, Pattern expression,
+                           boolean collapseRepeated, int depth, CaptureProfile profile, String host, Pattern expression,
                            boolean regex, boolean exclude) {}
 
     private record SearchResults(int scanned, boolean limited) {}
@@ -629,7 +632,7 @@ final class SearchPanel extends JPanel {
 
         private Iterable<CapturedEntry> loadEntries() {
             return () -> {
-                var records = new TrafficCatalog(api, store).stream(options.sources(), options.notePrefix(), options.host());
+                var records = new TrafficCatalog(api, store).stream(options.sources(), options.profile(), options.host());
                 if (context.cookie() != null) {
                     records = records.takeWhile(entry -> !isCancelled()).filter(entry ->
                             context.cookie().appliesTo(entry.requestResponse().request().httpService()));
@@ -642,7 +645,7 @@ final class SearchPanel extends JPanel {
                     records = records.filter(options.traffic()::matches);
                     var selected = context.selectedExchange();
                     if (selected != null && options.sources().contains(selected.source())) {
-                        var active = selected.entry(options.notePrefix());
+                        var active = selected.entry(options.profile());
                         if (active != null && TrafficCatalog.matchesHost(options.host(), active.requestResponse().request().httpService())
                                 && options.traffic().matches(active)) {
                             records = TrafficCatalog.includeSelected(records, active);

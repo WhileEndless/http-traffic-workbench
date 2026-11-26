@@ -27,7 +27,7 @@ final class BuildInfo {
 
     private static String version() {
         String manifestVersion = BuildInfo.class.getPackage().getImplementationVersion();
-        return manifestVersion == null ? "1.0.1" : manifestVersion;
+        return manifestVersion == null ? "1.0.2" : manifestVersion;
     }
 
     static void show(Component parent) {
