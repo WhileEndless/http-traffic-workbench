@@ -58,13 +58,14 @@ final class SearchPanel extends JPanel {
     private final JCheckBox collapseRepeated = new JCheckBox("Collapse repeated matches");
     private final JCheckBox sameHost = new JCheckBox("Same host", true);
     private final JCheckBox siblings = new JCheckBox("Neighboring fields");
-    private final JSpinner depth = new JSpinner(new SpinnerNumberModel(1, 0, 3, 1));
+    private final JSpinner depth = new JSpinner(new SpinnerNumberModel(3, 0, 3, 1));
     private final JCheckBox tabSeparator = new JCheckBox("Tab-separated", true);
     private final JLabel status = new JLabel("Ready to search.");
     private final JLabel pageLabel = new JLabel("0 results");
     private final JButton previous = new JButton("Previous");
     private final JButton next = new JButton("Next");
     private final JButton search = new JButton("Search");
+    private final JButton userPicker = new JButton("User filter…");
     private final JButton browse = new JButton("Browse traffic");
     private final JButton stop = new JButton("Stop");
     private final JButton copy = new JButton("Copy selected");
@@ -91,6 +92,7 @@ final class SearchPanel extends JPanel {
     private boolean updatingPage;
     private int page;
     private String referenceHost = "";
+    private String userFilter;
 
     SearchPanel(MontoyaApi api, CollectorStore store, ScanQueue scans, Supplier<CaptureProfile> profile,
                 Dataset initialDataset, Context context, Runnable closeDialog) {
@@ -100,6 +102,7 @@ final class SearchPanel extends JPanel {
         this.scans = scans;
         this.profile = profile;
         this.context = context;
+        userFilter = context.initialUser();
         initialQuery = context.selection().replace("\r", "\\r").replace("\n", "\\n");
         var selectedRequest = context.selectedExchange() == null ? null : context.selectedExchange().exchange().request();
         var selectedService = selectedRequest == null ? null : selectedRequest.httpService();
@@ -133,7 +136,7 @@ final class SearchPanel extends JPanel {
     }
 
     void searchSelection() {
-        if (hasSearchTerm()) {
+        if (hasSearchTerm() || !userFilter.isEmpty()) {
             search();
         } else {
             query.requestFocusInWindow();
@@ -202,9 +205,12 @@ final class SearchPanel extends JPanel {
         position.gridy = 0;
         position.anchor = GridBagConstraints.WEST;
         position.insets = new Insets(0, 0, 0, 12);
-        for (var control : List.of(sources, sameHost, labeled("Mode", mode), labeled("Depth", depth))) {
+        for (var control : List.of(sources, sameHost, labeled("Mode", mode), labeled("Depth", depth), userPicker)) {
             basicOptions.add(control, position);
         }
+        userPicker.setVisible(context.cookie() == null);
+        userPicker.addActionListener(event -> chooseUser());
+        updateUserPicker();
         position.weightx = 1;
         position.insets = new Insets(0, 0, 0, 0);
         basicOptions.add(Box.createHorizontalGlue(), position);
@@ -223,6 +229,7 @@ final class SearchPanel extends JPanel {
             partial.setSelected(true);
             collapseRepeated.setSelected(false);
             direction.setSelectedItem(ExtractEngine.Direction.BOTH);
+            if (!userFilter.isEmpty()) selectUser("");
         });
         formRow(advanced, 5, regex, negative, resetFilters);
         methods.setToolTipText("Comma-separated methods such as GET, POST.");
@@ -361,8 +368,65 @@ final class SearchPanel extends JPanel {
     }
 
     private void refreshSearch() {
-        if (hasSearchTerm()) search();
+        if (hasSearchTerm() || !userFilter.isEmpty()) search();
         else resetSearch();
+    }
+
+    private void chooseUser() {
+        var dialog = new JDialog(SwingUtilities.getWindowAncestor(this), "Filter by user", Dialog.ModalityType.DOCUMENT_MODAL);
+        var apply = new JButton("Apply");
+        var clear = new JButton("All users");
+        var cancel = new JButton("Cancel");
+        var directory = new UserDirectoryPanel(new TrafficCatalog(api, store), profile, apply);
+        var actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 6));
+        actions.add(clear);
+        actions.add(cancel);
+        actions.add(apply);
+        clear.setEnabled(!userFilter.isEmpty());
+        clear.addActionListener(event -> {
+            dialog.dispose();
+            selectUser("");
+        });
+        cancel.addActionListener(event -> dialog.dispose());
+        apply.addActionListener(event -> {
+            String selected = directory.selectedUser();
+            if (selected.isEmpty()) return;
+            dialog.dispose();
+            selectUser(selected);
+        });
+        var content = new JPanel(new BorderLayout());
+        content.add(directory, BorderLayout.CENTER);
+        content.add(actions, BorderLayout.SOUTH);
+        dialog.setContentPane(content);
+        dialog.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
+        dialog.getRootPane().setDefaultButton(apply);
+        dialog.getRootPane().registerKeyboardAction(event -> dialog.dispose(),
+                KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_ESCAPE, 0), JComponent.WHEN_IN_FOCUSED_WINDOW);
+        dialog.addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override public void windowOpened(java.awt.event.WindowEvent event) { directory.focusSearch(); }
+            @Override public void windowClosed(java.awt.event.WindowEvent event) {
+                directory.cancel();
+                userPicker.requestFocusInWindow();
+            }
+        });
+        api.userInterface().applyThemeToComponent(content);
+        dialog.setMinimumSize(new Dimension(420, 300));
+        dialog.setSize(480, 390);
+        dialog.setLocationRelativeTo(this);
+        directory.refresh(userFilter);
+        dialog.setVisible(true);
+    }
+
+    private void selectUser(String selected) {
+        if (userFilter.equals(selected)) return;
+        userFilter = selected;
+        updateUserPicker();
+        search();
+    }
+
+    private void updateUserPicker() {
+        userPicker.setText(userFilter.isEmpty() ? "User filter…" : "User filter (1)…");
+        userPicker.setToolTipText(userFilter.isEmpty() ? "Show traffic for a selected user." : "Selected user " + userFilter);
     }
 
     private void resetSearch() {
@@ -417,7 +481,7 @@ final class SearchPanel extends JPanel {
                 partial.isSelected(), siblings.isSelected(), context.cookie() == null && collapseRepeated.isSelected(),
                 context.cookie() == null ? (Integer) depth.getValue() : 0,
                 profile.get(), sameHost.isEnabled() && sameHost.isSelected() ? referenceHost : "",
-                expression, regexSearch, exclude);
+                expression, regexSearch, exclude, userFilter);
         model.originUser = "";
         pages.clear();
         otherUserPages.clear();
@@ -614,7 +678,7 @@ final class SearchPanel extends JPanel {
     private record Options(Set<TrafficSource> sources, Mode mode, ExtractEngine.Direction direction, String needle,
                            TrafficFilters traffic, boolean caseSensitive, boolean partial, boolean siblings,
                            boolean collapseRepeated, int depth, CaptureProfile profile, String host, Pattern expression,
-                           boolean regex, boolean exclude) {}
+                           boolean regex, boolean exclude, String user) {}
 
     private record SearchResults(int scanned, boolean limited) {}
 
@@ -654,12 +718,14 @@ final class SearchPanel extends JPanel {
                         .map(String::strip).filter(key -> !key.isEmpty()).distinct().toList(),
                         options.depth() > 0 || options.needle().indexOf('%') >= 0 ? context.fields().get() : List.of());
                 case VALUE -> engine.runValueFromContext(options.needle(),
-                        options.depth() > 0 || options.needle().indexOf('%') >= 0 ? context.fields().get() : List.of());
+                        options.depth() > 0 || options.needle().indexOf('%') >= 0 ? context.fields().get() : List.of(),
+                        context.selectionSide());
                 case TEXT -> {
                     if (options.expression() == null) engine.runText(options.needle(), options.caseSensitive());
                     else engine.runText(options.expression(), options.regex(), options.exclude());
                 }
-                case AUTO -> engine.runAutoFromContext(options.needle(), context.fields().get(), options.caseSensitive());
+                case AUTO -> engine.runAutoFromContext(options.needle(), context.fields().get(), options.caseSensitive(),
+                        context.selectionSide());
                 case COOKIE, COOKIE_ROTATION -> engine.runCookie(context.cookie(), options.traffic()::matches);
             }
             batches.flush();
@@ -685,6 +751,7 @@ final class SearchPanel extends JPanel {
                         records = TrafficCatalog.includeSelected(records, active);
                     }
                 }
+                if (!options.user().isEmpty()) records = records.filter(entry -> options.user().equals(entry.userCode()));
                 if (countedScan) return records.iterator();
                 countedScan = true;
                 return records.peek(entry -> scanned++).iterator();

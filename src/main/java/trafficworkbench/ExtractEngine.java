@@ -4,6 +4,7 @@ import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -14,6 +15,8 @@ import java.util.Locale;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import trafficworkbench.FieldExtractor.Kind;
+import trafficworkbench.FieldExtractor.JsonPath;
+import trafficworkbench.FieldExtractor.JsonScalar;
 import java.util.Set;
 
 /** Searches both message sides and expands relationships through exact shared field values. */
@@ -34,6 +37,7 @@ final class ExtractEngine {
     private static final int[] CONTEXT_VARIANT = {44, 42};
     private static final int[] ALIAS_VARIANT = {41, 38};
     private static final int[] DERIVED = {36, 33};
+    private static final int[] DERIVED_PARTIAL = {32, 29};
     private static final int[] SIBLING = {30, 25};
 
     static final int MAX_ROWS = 50_000;
@@ -86,11 +90,20 @@ final class ExtractEngine {
     }
     private record MatchKey(Object location, String side, FieldId field, int valueLength, int valueHash, String preview) {}
     private record FieldId(Kind kind, String name) {}
-    private record IndexedField(CapturedEntry.Key endpoint, String side, FieldId field, String value) {}
+    private record JsonField(String endpoint, JsonPath path) {}
+    private record JsonPeerField(String scope, String name, String evidence) {}
+    private record BodyAlias(String host, FieldId field) {}
+    private enum AliasKind { INTEGER, TEXT }
+    private record IndexedField(CapturedEntry.Key endpoint, String side, FieldId field, JsonPath path, String value) {}
 
     private final Map<FieldId, List<Hit>> byKey = new HashMap<>();
     private final Map<String, List<Hit>> byValue = new HashMap<>();
     private final Set<FieldId> matchedFields = new LinkedHashSet<>();
+    private final Map<JsonField, EnumSet<JsonScalar>> matchedJsonFields = new HashMap<>();
+    private final Map<JsonPeerField, EnumSet<JsonScalar>> matchedJsonPeers = new HashMap<>();
+    private final Map<BodyAlias, EnumSet<AliasKind>> exactBodyFields = new LinkedHashMap<>();
+    private final Set<JsonField> omittedJsonFields = new HashSet<>();
+    private boolean omittedJsonFieldsLimited;
 
     private static final class Hit {
         CapturedEntry entry;
@@ -295,7 +308,12 @@ final class ExtractEngine {
     }
 
     void runValueFromContext(String value, List<FieldExtractor.Pair> context) {
+        runValueFromContext(value, context, null);
+    }
+
+    void runValueFromContext(String value, List<FieldExtractor.Pair> context, CaptureProfile.Source side) {
         var term = SearchTerm.of(value, context);
+        rememberContextFields(term, context, side);
         run(depth > 0 ? term.keysIn(context) : Set.of(), term, null, Map.of());
     }
 
@@ -304,9 +322,51 @@ final class ExtractEngine {
     }
 
     void runAutoFromContext(String query, List<FieldExtractor.Pair> context, boolean caseSensitive) {
+        runAutoFromContext(query, context, caseSensitive, null);
+    }
+
+    void runAutoFromContext(String query, List<FieldExtractor.Pair> context, boolean caseSensitive,
+                            CaptureProfile.Source side) {
         var term = SearchTerm.of(query, context);
+        rememberContextFields(term, context, side);
         var values = pairedValues(context, field -> term.names(field, fieldId(field)), term);
         runAuto(term, term.keysIn(context), caseSensitive, values);
+    }
+
+    private void rememberContextFields(SearchTerm term, List<FieldExtractor.Pair> context, CaptureProfile.Source direction) {
+        if (depth == 0 || sourceEndpoint.isEmpty()) return;
+        String side = direction == CaptureProfile.Source.REQUEST ? REQ
+                : direction == CaptureProfile.Source.RESPONSE ? RESP : null;
+        for (var pair : context) {
+            if (pair.jsonScalar != null && term.matches(pair)) rememberJsonField(sourceEndpoint, side, pair);
+        }
+    }
+
+    private void rememberJsonField(String endpoint, String side, FieldExtractor.Pair pair) {
+        if (pair.key.length() > 256 || pair.value.length() > 2000 || pair.value.isBlank()
+                || !DiscoveryValues.usefulField(pair)) return;
+        var field = new JsonField(endpoint, pair.jsonPath);
+        if (matchedJsonFields.size() >= MAX_FRONTIER && !matchedJsonFields.containsKey(field)) {
+            discoveryLimited = true;
+            return;
+        }
+        matchedJsonFields.computeIfAbsent(field, ignored -> EnumSet.noneOf(JsonScalar.class)).add(pair.jsonScalar);
+        if (!DiscoveryValues.distinctiveFieldName(pair.key)) return;
+        if (side != null) rememberJsonPeer(new JsonPeerField(endpoint, pair.key, side), pair.jsonScalar);
+        String shape = DiscoveryValues.identifierShape(pair.value);
+        if (!shape.isEmpty()) rememberJsonPeer(new JsonPeerField(endpointHost(endpoint), pair.key, shape), pair.jsonScalar);
+    }
+
+    private void rememberJsonPeer(JsonPeerField field, JsonScalar scalar) {
+        if (matchedJsonPeers.size() < 2 * MAX_FRONTIER || matchedJsonPeers.containsKey(field)) {
+            matchedJsonPeers.computeIfAbsent(field, ignored -> EnumSet.noneOf(JsonScalar.class)).add(scalar);
+        }
+    }
+
+    private static String endpointHost(String endpoint) {
+        int start = endpoint.indexOf('|') + 1;
+        int end = endpoint.indexOf('|', start);
+        return end > start ? endpoint.substring(start, end) : "";
     }
 
     private Map<String, String> pairedValues(List<FieldExtractor.Pair> context,
@@ -343,6 +403,8 @@ final class ExtractEngine {
         static SearchTerm of(String raw, List<FieldExtractor.Pair> context) {
             var spellings = new LinkedHashSet<String>();
             spellings.add(raw);
+            String json = FieldExtractor.jsonString(raw);
+            if (!json.isBlank()) spellings.add(json);
             String utf8 = FieldExtractor.decodeFormComponent(raw);
             spellings.add(utf8);
             spellings.add(SearchEncoding.url(raw));
@@ -417,6 +479,7 @@ final class ExtractEngine {
                 && seedValue.spellings().stream().anyMatch(DiscoveryValues::calendarDate)
                 ? DiscoveryValues::calendarDate : similar;
         Map<String, String> nextValues = new LinkedHashMap<>(pairedValues);
+        Map<String, List<Hit>> recoveredLinks = Map.of();
         List<Hit> siblingHits = new ArrayList<>();
 
         int total = totalEntries;
@@ -444,18 +507,34 @@ final class ExtractEngine {
             for (FieldId field : byKey.keySet()) {
                 if (matchesName(seedKeys, field)) seenKeys.add(field);
             }
-            if (seedValue != null && seedValue.spellings().stream().anyMatch(ExtractEngine::isDistinctive)) {
-                expandMatchedFields(seedKeys, seedValue, seenKeys, nextValues, comparable);
+            if (seedValue != null && (!matchedJsonFields.isEmpty()
+                    || seedValue.spellings().stream().anyMatch(ExtractEngine::isDistinctive))) {
+                var scopedValues = new HashSet<String>();
+                expandMatchedFields(seedKeys, seedValue, seenKeys, nextValues, comparable, scopedValues);
+                var aliases = initialBodyAliases(seedKeys, seedValue);
+                if (!aliases.isEmpty() && !stop()) {
+                    followBodyAliases(aliases, seenValues, nextValues, scopedValues, seedValue, 1, true);
+                }
+                if (indexLimited && !scopedValues.isEmpty() && !stop()) {
+                    recoveredLinks = recoverExactLinks(scopedValues);
+                }
             }
         }
 
         for (int level = 1; level <= depth && !nextValues.isEmpty() && !stop(); level++) {
+            var linkedJsonFields = new LinkedHashMap<JsonField, EnumSet<JsonScalar>>();
+            var linkedBodyFields = new LinkedHashMap<BodyAlias, EnumSet<AliasKind>>();
+            var partialAnchors = new HashSet<String>();
+            if (partial && seedValue != null) {
+                showRelatedSubstrings(nextValues, seenValues, seedValue, level, linkedJsonFields, partialAnchors);
+            }
             Map<FieldId, Map<String, String>> links = new LinkedHashMap<>();
             for (var candidate : nextValues.entrySet()) {
                 if (stop()) return;
                 if (!seenValues.add(candidate.getKey())) continue;
                 var keys = new LinkedHashSet<FieldId>();
-                for (Hit hit : byValue.getOrDefault(candidate.getKey(), List.of())) {
+                for (Hit hit : recoveredLinks.getOrDefault(candidate.getKey(),
+                        byValue.getOrDefault(candidate.getKey(), List.of()))) {
                     keys.add(fieldId(hit.pair));
                     if (keys.size() > MAX_FANOUT) break;
                 }
@@ -490,14 +569,27 @@ final class ExtractEngine {
                         .map(evidence -> DiscoveryValues.calendarDate(evidence.getKey())
                                 ? (Predicate<String>) DiscoveryValues::calendarDate : DiscoveryValues.similarTo(evidence.getKey()))
                         .filter(format -> format != DiscoveryValues.NO_COMPARISON).toList() : List.<Predicate<String>>of();
+                for (var evidence : link.getValue().entrySet()) {
+                    String value = evidence.getKey();
+                    boolean replayed = recoveredLinks.containsKey(value);
+                    boolean learnField = !value.equals(evidence.getValue());
+                    if (!replayed && !learnField) continue;
+                    for (var hit : recoveredLinks.getOrDefault(value, byValue.getOrDefault(value, List.of()))) {
+                        if (stop()) return;
+                        if (!key.equals(fieldId(hit.pair))) continue;
+                        if (replayed) emitRelated(hit, evidence.getValue(), score, depthLabel);
+                        if (learnField) {
+                            rememberBodyAlias(linkedBodyFields, hit.entry, hit.pair);
+                            if (level < depth) rememberLinkedJsonField(linkedJsonFields, hit.entry, hit.pair);
+                        }
+                    }
+                }
                 for (Hit hit : hits) {
                     if (stop()) return;
                     String value = hit.linkValue;
                     String origin = link.getValue().get(value);
                     if (origin != null) {
-                        String reason = origin.equals(value) ? "Field name used as value" + depthLabel + " ← " + origin
-                                : "Related field" + depthLabel + " ← " + origin + "=" + shorten(value);
-                        emitStructured(hit.entry, hit.src, hit.pair, score, reason, true, hit.pair.wireValue());
+                        if (!recoveredLinks.containsKey(value)) emitRelated(hit, origin, score, depthLabel);
                     } else if (expand && DiscoveryValues.linkableValue(value) && (seedValue == null
                             || comparable.test(value) || formats.stream().anyMatch(format -> format.test(value)))) {
                         // Other values may help verify a later link. They do not become results on their own.
@@ -505,6 +597,14 @@ final class ExtractEngine {
                     }
                 }
             }
+            if (!linkedBodyFields.isEmpty() && !stop()) {
+                followBodyAliases(linkedBodyFields, seenValues, nextValues, null, seedValue, level, level < depth);
+            }
+            if (!linkedJsonFields.isEmpty() && !stop()) {
+                followLinkedJsonFields(linkedJsonFields, seenValues, partialAnchors, nextValues);
+            }
+            recoveredLinks = indexLimited && level < depth && !nextValues.isEmpty() && !stop()
+                    ? recoverExactLinks(nextValues.keySet()) : Map.of();
         }
 
         if (siblings) {
@@ -516,6 +616,185 @@ final class ExtractEngine {
                 emitStructured(h.entry, h.src, h.pair, SIBLING, "Neighboring field", true, h.pair.wireValue());
             }
         }
+    }
+
+    private Map<BodyAlias, EnumSet<AliasKind>> initialBodyAliases(Set<String> seedKeys, SearchTerm term) {
+        var contextualNames = new HashSet<>(seedKeys);
+        contextualNames.removeAll(term.spellings());
+        if (contextualNames.isEmpty() && matchedFields.stream().filter(field -> field.kind() == Kind.BODY).count() < 2) {
+            return Map.of();
+        }
+        var aliases = new LinkedHashMap<>(exactBodyFields);
+        aliases.keySet().removeIf(alias -> matchesName(contextualNames, alias.field()));
+        return aliases;
+    }
+
+    private void rememberBodyAlias(Map<BodyAlias, EnumSet<AliasKind>> aliases, CapturedEntry entry,
+                                   FieldExtractor.Pair pair) {
+        if (pair.kind != Kind.BODY || pair.domId || !DiscoveryValues.usefulField(pair)
+                || !DiscoveryValues.distinctiveFieldName(pair.key)) return;
+        var host = entry.requestResponse().request().httpService().host().toLowerCase(Locale.ROOT);
+        var kind = aliasKind(pair);
+        if (kind == null) return;
+        var alias = new BodyAlias(host, fieldId(pair));
+        if (aliases.size() >= MAX_FRONTIER && !aliases.containsKey(alias)) {
+            discoveryLimited = true;
+            return;
+        }
+        aliases.computeIfAbsent(alias, ignored -> EnumSet.noneOf(AliasKind.class)).add(kind);
+    }
+
+    private static AliasKind aliasKind(FieldExtractor.Pair pair) {
+        String value = linkValue(pair);
+        if (pair.jsonScalar != null && DiscoveryValues.decimalInteger(value)) return AliasKind.INTEGER;
+        if (!DiscoveryValues.linkableValue(value) || DiscoveryValues.calendarDate(value)) return null;
+        return DiscoveryValues.decimalInteger(value) ? AliasKind.INTEGER : AliasKind.TEXT;
+    }
+
+    private void followBodyAliases(Map<BodyAlias, EnumSet<AliasKind>> aliases, Set<String> seen,
+                                   Map<String, String> next, Set<String> recoveredValues, SearchTerm seed,
+                                   int level, boolean propagate) {
+        var variants = new HashMap<BodyAlias, Set<String>>();
+        var names = new LinkedHashSet<FieldId>();
+        var hosts = new HashSet<String>();
+        for (var alias : aliases.keySet()) {
+            names.add(alias.field());
+            hosts.add(alias.host());
+        }
+        int offset = 10 * (level - 1);
+        int[] score = {Math.max(DERIVED[0] - offset - 1, 5), Math.max(DERIVED[1] - offset - 1, 5)};
+        String depthLabel = level > 1 ? " (level " + level + ")" : "";
+        DiscoveryVisitor visitor = (entry, side, pair) -> {
+            var field = fieldId(pair);
+            if (!names.contains(field) || pair.domId || !DiscoveryValues.usefulField(pair)) return;
+            var host = entry.requestResponse().request().httpService().host().toLowerCase(Locale.ROOT);
+            var alias = new BodyAlias(host, field);
+            var kinds = aliases.get(alias);
+            if (kinds == null || !kinds.contains(aliasKind(pair))) return;
+            String value = linkValue(pair);
+            if (seen.contains(value) || seed != null && (seed.matches(pair)
+                    || partial && seed.containedIn(pair.value) != null)) return;
+            var values = variants.computeIfAbsent(alias, ignored -> new HashSet<>());
+            if (values.size() >= MAX_VARIANT_VALUES && !values.contains(value)) {
+                discoveryLimited = true;
+                return;
+            }
+            boolean first = values.add(value);
+            emitStructured(entry, side, pair, score, "Related value in linked field" + depthLabel, true, pair.wireValue());
+            if (first && propagate) {
+                if (value.length() < 5 && DiscoveryValues.decimalInteger(value) && next.size() < MAX_VALUES_PER_LEVEL) {
+                    next.putIfAbsent(value, pair.key);
+                } else {
+                    collectValue(next, seen, value, pair.key);
+                }
+                if (recoveredValues != null && next.containsKey(value)) recoveredValues.add(value);
+            }
+        };
+        if (indexLimited) {
+            replayDiscovery("Checking linked field names",
+                    entry -> hosts.contains(entry.requestResponse().request().httpService().host().toLowerCase(Locale.ROOT)),
+                    visitor);
+            return;
+        }
+        for (var name : names) {
+            for (var hit : byKey.getOrDefault(name, List.of())) {
+                if (stop()) return;
+                visitor.field(hit.entry, hit.src, hit.pair);
+            }
+        }
+    }
+
+    private void rememberLinkedJsonField(Map<JsonField, EnumSet<JsonScalar>> fields,
+                                         CapturedEntry entry, FieldExtractor.Pair pair) {
+        if (pair.jsonScalar == null || !DiscoveryValues.usefulField(pair)) return;
+        var field = new JsonField(CapturedEntry.endpoint(entry.requestResponse().request()), pair.jsonPath);
+        if (fields.size() >= MAX_FRONTIER && !fields.containsKey(field)) {
+            discoveryLimited = true;
+            return;
+        }
+        fields.computeIfAbsent(field, ignored -> EnumSet.noneOf(JsonScalar.class)).add(pair.jsonScalar);
+    }
+
+    private void followLinkedJsonFields(Map<JsonField, EnumSet<JsonScalar>> fields, Set<String> seen, Set<String> partialAnchors,
+                                        Map<String, String> next) {
+        var variants = new HashMap<JsonField, Set<String>>();
+        DiscoveryVisitor visitor = (entry, side, pair) -> {
+            if (pair.jsonScalar == null) return;
+            var field = new JsonField(CapturedEntry.endpoint(entry.requestResponse().request()), pair.jsonPath);
+            if (!compatibleType(pair.jsonScalar, fields.get(field))) return;
+            String value = linkValue(pair);
+            if (seen.contains(value) || partialAnchors.contains(value) || next.containsKey(value)) return;
+            var values = variants.computeIfAbsent(field, ignored -> new HashSet<>());
+            if (values.size() >= MAX_VARIANT_VALUES && !values.contains(value)) {
+                discoveryLimited = true;
+            } else if (values.add(value)) {
+                if (value.length() < 5 && DiscoveryValues.decimalInteger(value) && next.size() < MAX_VALUES_PER_LEVEL) {
+                    next.putIfAbsent(value, pair.key);
+                } else {
+                    collectValue(next, seen, value, pair.key);
+                }
+            }
+        };
+        if (indexLimited) {
+            var endpoints = new HashSet<String>();
+            for (var field : fields.keySet()) endpoints.add(field.endpoint());
+            replayDiscovery("Checking linked JSON fields",
+                    entry -> endpoints.contains(CapturedEntry.endpoint(entry.requestResponse().request())), visitor);
+            return;
+        }
+        var keys = new LinkedHashSet<String>();
+        for (var field : fields.keySet()) keys.add(field.path().name());
+        for (String key : keys) {
+            for (var hit : byKey.getOrDefault(new FieldId(Kind.BODY, key), List.of())) {
+                if (stop()) return;
+                visitor.field(hit.entry, hit.src, hit.pair);
+            }
+        }
+    }
+
+    private void emitRelated(Hit hit, String origin, int[] score, String depthLabel) {
+        String reason = origin.equals(hit.linkValue) ? "Field name used as value" + depthLabel + " ← " + origin
+                : "Related field" + depthLabel + " ← " + origin + "=" + shorten(hit.linkValue);
+        emitStructured(hit.entry, hit.src, hit.pair, score, reason, true, hit.pair.wireValue());
+    }
+
+    private void showRelatedSubstrings(Map<String, String> values, Set<String> seen, SearchTerm seed, int level,
+                                       Map<JsonField, EnumSet<JsonScalar>> linkedFields, Set<String> partialAnchors) {
+        var terms = new ArrayList<String>();
+        for (var candidate : values.entrySet()) {
+            String value = candidate.getKey();
+            if (seen.contains(value) || value.equals(candidate.getValue())
+                    || value.length() < 5 || value.length() > 128 || !DiscoveryValues.linkableValue(value)) continue;
+            if (terms.size() == MAX_FRONTIER) {
+                discoveryLimited = true;
+                break;
+            }
+            terms.add(value);
+        }
+        if (terms.isEmpty()) return;
+        terms.sort(java.util.Comparator.comparingInt(String::length).reversed());
+        String alternatives = terms.stream().map(Pattern::quote).collect(java.util.stream.Collectors.joining("|"));
+        var pattern = Pattern.compile("(?<![\\p{L}\\p{N}_])(?:" + alternatives + ")(?![\\p{L}\\p{N}_])");
+        String depthLabel = level > 1 ? " (level " + level + ")" : "";
+        int offset = 10 * (level - 1);
+        int[] score = {Math.max(DERIVED_PARTIAL[0] - offset, 5), Math.max(DERIVED_PARTIAL[1] - offset, 5)};
+        replayDiscovery("Checking partial related values", ignored -> true, (entry, side, pair) -> {
+            if (!DiscoveryValues.usefulField(pair) || seed.matches(pair) || seed.containedIn(pair.value) != null) return;
+            String linked = linkValue(pair);
+            if (values.containsKey(linked)) return;
+            var match = pattern.matcher(linked);
+            if (match.find()) {
+                String value = match.group();
+                emitStructured(entry, side, pair, score,
+                        "Partial related value" + depthLabel + " ← " + values.get(value) + "=" + shorten(value),
+                        true, linked.equals(pair.value) && pair.form == null ? value : pair.wireValue());
+                if (level < depth && pair.jsonScalar != null && DiscoveryValues.distinctiveFieldName(pair.key)
+                        && partialAnchors.size() < MAX_VALUES_PER_LEVEL) {
+                    rememberLinkedJsonField(linkedFields, entry, pair);
+                    partialAnchors.add(linked);
+                }
+            }
+        });
     }
 
     private void scanSource(CapturedEntry e, String src, Util.MessageText message, Set<String> seedKeys,
@@ -546,14 +825,23 @@ final class ExtractEngine {
             boolean protectedValue = HttpSearchFields.protectedValue(p);
             boolean boundedField = depth > 0 && p.key.length() <= 256 && p.value.length() <= 2000;
             boolean discoverable = boundedField && HttpSearchFields.indexForDiscovery(p, protectedValue);
+            boolean exact = seedValue != null && seedValue.matches(p);
             if (discoverable) {
-                indexField(e, src, p, endpoint, nextValues.keySet());
+                boolean indexed = indexField(e, src, p, endpoint, nextValues.keySet());
+                if (!indexed && !exact && seedValue != null && p.jsonScalar != null && !omittedJsonFieldsLimited
+                        && DiscoveryValues.usefulField(p)) {
+                    omittedJsonFields.add(new JsonField(CapturedEntry.endpoint(exchange.request()), p.jsonPath));
+                    omittedJsonFieldsLimited = omittedJsonFields.size() >= MAX_FRONTIER;
+                }
             }
 
-            boolean exact = seedValue != null && seedValue.matches(p);
             // An ID-only control can corroborate the same key elsewhere. A DOM alias cannot establish a field.
             if (exact && (discoverable || boundedField && p.domId && !p.domAlias)
                     && matchedFields.size() < MAX_FRONTIER) matchedFields.add(field);
+            if (exact && discoverable && p.jsonScalar != null) {
+                rememberJsonField(CapturedEntry.endpoint(exchange.request()), src, p);
+            }
+            if (exact && discoverable) rememberBodyAlias(exactBodyFields, e, p);
             String partialMatch = !exact && !named && seedValue != null && partial && p.kind != Kind.COOKIE
                     ? seedValue.containedIn(p.value) : null;
             if (exact || named) {
@@ -597,7 +885,8 @@ final class ExtractEngine {
 
 
     private void expandMatchedFields(Set<String> seedKeys, SearchTerm searched, Set<FieldId> seenKeys,
-                                     Map<String, String> nextValues, Predicate<String> comparable) {
+                                     Map<String, String> nextValues, Predicate<String> comparable,
+                                     Set<String> scopedValues) {
         var bodyNames = new LinkedHashSet<String>();
         for (var field : matchedFields) {
             if (field.kind() == Kind.BODY) {
@@ -624,6 +913,11 @@ final class ExtractEngine {
                 if (knownField.test(field)) showFieldVariant(hit.entry, hit.src, hit.pair, matchesName(seedKeys, field));
             }
         }
+        var peerNames = new HashSet<String>();
+        for (var field : matchedJsonPeers.keySet()) peerNames.add(field.name());
+        boolean recoverScoped = !matchedJsonFields.isEmpty() && (omittedJsonFieldsLimited
+                || omittedJsonFields.stream().anyMatch(field -> matchedJsonFields.containsKey(field)
+                        || peerNames.contains(field.path().name())));
         int count = 0;
         for (FieldId field : candidates) {
             if (stop()) return;
@@ -646,7 +940,10 @@ final class ExtractEngine {
             for (Hit hit : hits) {
                 if (stop()) return;
                 String value = hit.linkValue;
-                if (!variantOf(hit.pair, searched, comparable)) continue;
+                boolean scoped = useful && !recoverScoped && !matchedJsonFields.isEmpty()
+                        && scopedJsonVariant(hit.entry, hit.src, hit.pair, searched);
+                if (!scoped && !variantOf(hit.pair, searched, comparable)) continue;
+                if (scoped) showFieldVariant(hit.entry, hit.src, hit.pair, contextual);
                 if (!propagate) continue;
                 if (!variants.contains(value) && variants.size() >= MAX_VARIANT_VALUES) {
                     discoveryLimited = true;
@@ -659,47 +956,132 @@ final class ExtractEngine {
                     }
                     continue;
                 }
-                if (first) collectValue(nextValues, Set.of(), value, hit.pair.key);
+                if (first) collectVariantLink(nextValues, hit.pair, value, scoped ? scopedValues : null);
             }
             if (useful) seenKeys.add(field);
+        }
+        if (recoverScoped && !stop()) {
+            recoverScopedVariants(searched, seedKeys, comparable, nextValues, seenKeys, scopedValues);
+        }
+    }
+
+    private boolean scopedJsonVariant(CapturedEntry entry, String side, FieldExtractor.Pair pair, SearchTerm searched) {
+        if (pair.jsonScalar == null || searched.matches(pair) || partial && searched.containedIn(pair.value) != null) {
+            return false;
+        }
+        var endpoint = CapturedEntry.endpoint(entry.requestResponse().request());
+        if (compatibleType(pair.jsonScalar, matchedJsonFields.get(new JsonField(endpoint, pair.jsonPath)))) return true;
+        if (matchedJsonPeers.isEmpty() || !DiscoveryValues.distinctiveFieldName(pair.key)) return false;
+        String oppositeSide = side.equals(REQ) ? RESP : REQ;
+        if (compatibleType(pair.jsonScalar,
+                matchedJsonPeers.get(new JsonPeerField(endpoint, pair.key, oppositeSide)))) return true;
+        String shape = DiscoveryValues.identifierShape(pair.value);
+        return !shape.isEmpty() && compatibleType(pair.jsonScalar,
+                matchedJsonPeers.get(new JsonPeerField(endpointHost(endpoint), pair.key, shape)));
+    }
+
+    private static boolean compatibleType(JsonScalar candidate, Set<JsonScalar> types) {
+        return types != null && switch (candidate) {
+            case STRING -> types.contains(JsonScalar.STRING) || types.contains(JsonScalar.INTEGER_STRING);
+            case INTEGER_STRING -> true;
+            case INTEGER -> types.contains(JsonScalar.INTEGER) || types.contains(JsonScalar.INTEGER_STRING);
+        };
+    }
+
+    private void recoverScopedVariants(SearchTerm searched, Set<String> seedKeys, Predicate<String> comparable,
+                                       Map<String, String> nextValues, Set<FieldId> seenKeys, Set<String> scopedValues) {
+        var variants = new HashMap<FieldId, Set<String>>();
+        var endpoints = new HashSet<String>();
+        var hosts = new HashSet<String>();
+        for (var field : matchedJsonFields.keySet()) {
+            endpoints.add(field.endpoint());
+            if (!matchedJsonPeers.isEmpty()) hosts.add(endpointHost(field.endpoint()));
+        }
+        replayDiscovery("Checking matching JSON paths",
+                entry -> endpoints.contains(CapturedEntry.endpoint(entry.requestResponse().request()))
+                        || hosts.contains(endpointHost(CapturedEntry.endpoint(entry.requestResponse().request()))),
+                (entry, side, pair) -> {
+            if (!DiscoveryValues.usefulField(pair) || !scopedJsonVariant(entry, side, pair, searched)) return;
+            var field = fieldId(pair);
+            if (!variantOf(pair, searched, comparable)) {
+                showFieldVariant(entry, side, pair, matchesName(seedKeys, field));
+            }
+            seenKeys.add(field);
+            var values = variants.computeIfAbsent(field, ignored -> new HashSet<>());
+            String value = linkValue(pair);
+            if (values.size() < MAX_VARIANT_VALUES && values.add(value)) {
+                collectVariantLink(nextValues, pair, value, scopedValues);
+            } else if (!values.contains(value)) {
+                discoveryLimited = true;
+            }
+        });
+    }
+
+    private static void collectVariantLink(Map<String, String> nextValues, FieldExtractor.Pair pair, String value,
+                                           Set<String> scopedValues) {
+        if (scopedValues != null && value.length() < 5 && DiscoveryValues.decimalInteger(value)) {
+            if (nextValues.size() < MAX_VALUES_PER_LEVEL) nextValues.putIfAbsent(value, pair.key);
+        } else {
+            collectValue(nextValues, Set.of(), value, pair.key);
+        }
+        if (scopedValues != null && nextValues.containsKey(value)) scopedValues.add(value);
+    }
+
+    private Map<String, List<Hit>> recoverExactLinks(Set<String> values) {
+        var recovered = new HashMap<String, List<Hit>>();
+        int[] budget = {MAX_KNOWN_LINK_HITS, MAX_KNOWN_LINK_CHARACTERS};
+        replayDiscovery("Checking exact related values", ignored -> true, (entry, side, pair) -> {
+            String value = linkValue(pair);
+            if (!values.contains(value)) return;
+            int size = retainedCharacters(pair);
+            if (budget[0] > 0 && budget[1] >= size) {
+                recovered.computeIfAbsent(value, ignored -> new ArrayList<>()).add(new Hit(entry, side, pair, value));
+                budget[0]--;
+                budget[1] -= size;
+            }
+        });
+        return recovered;
+    }
+
+    @FunctionalInterface
+    private interface DiscoveryVisitor {
+        void field(CapturedEntry entry, String side, FieldExtractor.Pair pair);
+    }
+
+    private void replayDiscovery(String phase, Predicate<CapturedEntry> includes, DiscoveryVisitor visitor) {
+        int count = 0;
+        for (var records = entries.iterator(); !stop() && records.hasNext();) {
+            if ((count & 31) == 0) {
+                if (count > 0) java.util.concurrent.locks.LockSupport.parkNanos(1_000_000);
+                sink.progress(phase, count, totalEntries);
+            }
+            count++;
+            var entry = records.next();
+            if (entry == null || !includes.test(entry)) continue;
+            if (direction != Direction.RESPONSE) replayDiscovery(entry, REQ, visitor);
+            if (direction != Direction.REQUEST && entry.hasResponse() && !stop()) replayDiscovery(entry, RESP, visitor);
+        }
+    }
+
+    private void replayDiscovery(CapturedEntry entry, String side, DiscoveryVisitor visitor) {
+        for (var pair : HttpSearchFields.collect(entry.requestResponse(), side.equals(REQ))) {
+            if (stop()) return;
+            if (!pair.value.isBlank() && pair.key.length() <= 256 && pair.value.length() <= 2000
+                    && HttpSearchFields.indexForDiscovery(pair, HttpSearchFields.protectedValue(pair))) {
+                visitor.field(entry, side, pair);
+            }
         }
     }
 
     private void recoverFieldVariants(Predicate<FieldId> knownField, Set<String> seedKeys,
                                       SearchTerm searched, Predicate<String> comparable) {
-        int scanned = 0;
-        for (var records = entries.iterator(); !stop() && records.hasNext();) {
-            if ((scanned & 31) == 0) {
-                if (scanned > 0) java.util.concurrent.locks.LockSupport.parkNanos(1_000_000);
-                sink.progress("Checking matching fields across traffic", scanned, totalEntries);
-            }
-            var entry = records.next();
-            scanned++;
-            if (entry == null) continue;
-            var exchange = entry.requestResponse();
-            if (direction != Direction.RESPONSE) {
-                recoverFieldVariants(entry, REQ, HttpSearchFields.collect(exchange, true),
-                        knownField, seedKeys, searched, comparable);
-            }
-            if (direction != Direction.REQUEST && exchange.response() != null && !stop()) {
-                recoverFieldVariants(entry, RESP, HttpSearchFields.collect(exchange, false),
-                        knownField, seedKeys, searched, comparable);
-            }
-        }
-    }
-
-    private void recoverFieldVariants(CapturedEntry entry, String side, List<FieldExtractor.Pair> fields,
-                                      Predicate<FieldId> knownField, Set<String> seedKeys,
-                                      SearchTerm searched, Predicate<String> comparable) {
-        for (var pair : fields) {
-            if (stop()) return;
+        replayDiscovery("Checking matching fields across traffic", ignored -> true, (entry, side, pair) -> {
             var field = fieldId(pair);
             if (!matchesName(seedKeys, field) && !(pair.form != null && seedKeys.contains(pair.wireKey()))
-                    && knownField.test(field) && HttpSearchFields.indexForDiscovery(pair, HttpSearchFields.protectedValue(pair))
-                    && DiscoveryValues.usefulField(pair) && variantOf(pair, searched, comparable)) {
-                showFieldVariant(entry, side, pair, matchesName(seedKeys, field));
+                    && knownField.test(field) && DiscoveryValues.usefulField(pair) && variantOf(pair, searched, comparable)) {
+                showFieldVariant(entry, side, pair, false);
             }
-        }
+        });
     }
 
     private boolean variantOf(FieldExtractor.Pair pair, SearchTerm searched, Predicate<String> comparable) {
@@ -766,15 +1148,15 @@ final class ExtractEngine {
         };
     }
 
-    private void indexField(CapturedEntry entry, String side, FieldExtractor.Pair pair,
+    private boolean indexField(CapturedEntry entry, String side, FieldExtractor.Pair pair,
                             CapturedEntry.Key endpoint, Set<String> knownLinks) {
-        if (indexLimited && endpoint == null && (knownLinks.isEmpty() || knownLinkHits >= MAX_KNOWN_LINK_HITS)) return;
+        if (indexLimited && endpoint == null && (knownLinks.isEmpty() || knownLinkHits >= MAX_KNOWN_LINK_HITS)) return false;
         String linked = linkValue(pair);
-        var key = endpoint == null ? null : new IndexedField(endpoint, side, fieldId(pair), linked);
+        var key = endpoint == null ? null : new IndexedField(endpoint, side, fieldId(pair), pair.jsonPath, linked);
         var existing = key == null ? null : indexed.get(key);
         if (existing != null) {
             if (!existing.entry.hasResponse() && entry.hasResponse()) existing.entry = entry;
-            return;
+            return true;
         }
         int size = retainedCharacters(pair) + (linked.equals(pair.value) ? 0 : linked.length());
         if (indexLimited || indexedPairs >= MAX_DISCOVERY_PAIRS || indexedCharacters >= MAX_DISCOVERY_CHARACTERS) {
@@ -782,7 +1164,7 @@ final class ExtractEngine {
             discoveryLimited = true;
             // Keep room for exact links established by the selected message or already scanned fields.
             if (!knownLinks.contains(linked) || knownLinkHits >= MAX_KNOWN_LINK_HITS
-                    || knownLinkCharacters + size > MAX_KNOWN_LINK_CHARACTERS) return;
+                    || knownLinkCharacters + size > MAX_KNOWN_LINK_CHARACTERS) return false;
             knownLinkHits++;
             knownLinkCharacters += size;
         } else {
@@ -792,13 +1174,15 @@ final class ExtractEngine {
         var hit = new Hit(entry, side, pair, linked);
         if (key != null) indexed.put(key, hit);
         byKey.computeIfAbsent(fieldId(pair), ignored -> new ArrayList<>()).add(hit);
-        if (isDistinctive(linked)) {
+        if (isDistinctive(linked) || linked.length() < 5 && DiscoveryValues.decimalInteger(linked)) {
             byValue.computeIfAbsent(linked, ignored -> new ArrayList<>()).add(hit);
         }
+        return true;
     }
 
     private static int retainedCharacters(FieldExtractor.Pair pair) {
         int size = pair.key.length() + pair.value.length();
+        if (pair.jsonPath != null) size += pair.jsonPath.length();
         if (pair.wireKey() != pair.key) size += pair.wireKey().length();
         if (pair.wireValue() != pair.value) size += pair.wireValue().length();
         return size;

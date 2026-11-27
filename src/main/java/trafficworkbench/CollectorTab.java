@@ -51,6 +51,7 @@ final class CollectorTab {
     private boolean closed;
     private SwingWorker<?, ?> archiveTask;
     private ProfileDialog settings;
+    private UserDirectoryPanel users;
 
     CollectorTab(MontoyaApi api, CollectorStore store, SearchContextMenu menu,
                  Supplier<CaptureProfile> profile, ProfileDialog.SaveProfile saveProfile) {
@@ -82,6 +83,7 @@ final class CollectorTab {
             reload.stop();
             if (archiveTask != null) archiveTask.cancel(true);
             if (settings != null) settings.closeOnUnload();
+            users.cancel();
         });
     }
 
@@ -133,7 +135,6 @@ final class CollectorTab {
         });
         filterRow.add(reset);
         filterRow.add(count);
-        toolbar.add(filterRow);
         root.add(toolbar, BorderLayout.NORTH);
 
         var debounce = new Timer(180, event -> applyFilter());
@@ -160,7 +161,6 @@ final class CollectorTab {
         archiveCards.add(new JScrollPane(table), "table");
         archiveCards.add(archiveEmpty, "empty");
         var center = ExchangeView.split(JSplitPane.VERTICAL_SPLIT, archiveCards, exchange.component(), .58);
-        root.add(center, BorderLayout.CENTER);
 
         JPanel footer = new JPanel(new BorderLayout());
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
@@ -176,7 +176,26 @@ final class CollectorTab {
         for (var button : List.of(importButton, exportButton, clear)) actions.add(button);
         footer.add(actions, BorderLayout.EAST);
         footer.add(status, BorderLayout.CENTER);
-        root.add(footer, BorderLayout.SOUTH);
+        var archiveView = new JPanel(new BorderLayout(0, 4));
+        archiveView.add(filterRow, BorderLayout.NORTH);
+        archiveView.add(center, BorderLayout.CENTER);
+        archiveView.add(footer, BorderLayout.SOUTH);
+        var userView = new JPanel(new BorderLayout());
+        var browseUser = new JButton("Browse user traffic");
+        users = new UserDirectoryPanel(new TrafficCatalog(api, store), profile, browseUser);
+        browseUser.addActionListener(event -> menu.open(ExtractDialog.Dataset.ALL,
+                ExtractDialog.Context.forUser(users.selectedUser())));
+        userView.add(users, BorderLayout.CENTER);
+        var userActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 4));
+        userActions.add(browseUser);
+        userView.add(userActions, BorderLayout.SOUTH);
+        var views = new JTabbedPane();
+        views.addTab("Archive", archiveView);
+        views.addTab("Users", userView);
+        views.addChangeListener(event -> {
+            if (views.getSelectedComponent() == userView) users.refresh(users.selectedUser());
+        });
+        root.add(views, BorderLayout.CENTER);
         updateStatus();
     }
 

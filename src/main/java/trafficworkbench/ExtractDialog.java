@@ -15,7 +15,7 @@ final class ExtractDialog extends JDialog {
 
         java.util.Set<TrafficSource> sources() {
             return switch (this) {
-                case ALL -> java.util.EnumSet.allOf(TrafficSource.class);
+                case ALL -> java.util.EnumSet.complementOf(java.util.EnumSet.of(TrafficSource.SITE_MAP));
                 case HISTORY -> java.util.Set.of(TrafficSource.PROXY);
                 case ARCHIVE -> {
                     var selected = java.util.EnumSet.copyOf(TrafficSource.capturedSources());
@@ -33,12 +33,24 @@ final class ExtractDialog extends JDialog {
     }
 
     record Context(String selection, String path, Supplier<List<FieldExtractor.Pair>> fields,
-                   CookieTrace cookie, SelectedExchange selectedExchange) {
+                   CookieTrace cookie, SelectedExchange selectedExchange, CaptureProfile.Source selectionSide,
+                   String initialUser) {
+        Context(String selection, String path, Supplier<List<FieldExtractor.Pair>> fields,
+                CookieTrace cookie, SelectedExchange selectedExchange, CaptureProfile.Source selectionSide) {
+            this(selection, path, fields, cookie, selectedExchange, selectionSide, "");
+        }
+
+        Context(String selection, String path, Supplier<List<FieldExtractor.Pair>> fields,
+                CookieTrace cookie, SelectedExchange selectedExchange) {
+            this(selection, path, fields, cookie, selectedExchange, null);
+        }
+
         Context(String selection, String path, Supplier<List<FieldExtractor.Pair>> fields) {
             this(selection, path, fields, null, null);
         }
 
         static Context empty() { return new Context("", "", List::of); }
+        static Context forUser(String user) { return new Context("", "", List::of, null, null, null, user); }
     }
 
     private final SearchPanel panel;

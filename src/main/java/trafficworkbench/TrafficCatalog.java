@@ -18,6 +18,7 @@ import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.stream.StreamSupport;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.stream.Stream;
 
 final class TrafficCatalog {
@@ -29,6 +30,31 @@ final class TrafficCatalog {
     TrafficCatalog(MontoyaApi api, CollectorStore store) {
         this.api = api;
         this.store = store;
+    }
+
+    record UserCount(String label, int records) {}
+    record Users(List<UserCount> entries, boolean proxyUnavailable) {}
+
+    Users users(CaptureProfile profile, BooleanSupplier cancelled) {
+        var counts = new TreeMap<String, Integer>();
+        boolean proxyUnavailable = false;
+        try {
+            for (var item : api.proxy().history()) {
+                if (cancelled.getAsBoolean()) break;
+                var annotations = item.annotations();
+                if (annotations == null) continue;
+                String label = UserLabeler.readNote(annotations.notes(), profile);
+                if (!label.isEmpty()) counts.merge(label, 1, Integer::sum);
+            }
+        } catch (RuntimeException ignored) {
+            proxyUnavailable = true;
+        }
+        for (var entry : store.all()) {
+            if (cancelled.getAsBoolean()) break;
+            if (!entry.userCode().isEmpty()) counts.merge(entry.userCode(), 1, Integer::sum);
+        }
+        return new Users(counts.entrySet().stream().map(entry -> new UserCount(entry.getKey(), entry.getValue()))
+                .toList(), proxyUnavailable);
     }
 
     Stream<CapturedEntry> stream(Set<TrafficSource> selected, CaptureProfile profile) {

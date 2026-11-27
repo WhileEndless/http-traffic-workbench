@@ -1,5 +1,16 @@
 # Release notes
 
+## 1.2.0
+
+- Add a searchable **Users** tab for labels observed in Proxy history and saved traffic. Select a label to browse its records or use **User filter** in search.
+- Search for compatible JSON fields across requests and responses. Follow exact matches through other fields at up to three levels, the new default.
+- Follow learned field names across JSON, HTML, static JavaScript, XML, and forms, including links between decimal integers and their text spellings.
+- With **Partial value matches** enabled, find discovered values inside longer fields at token boundaries.
+- Match quoted and unquoted decimal integer values in JSON. Continue checking related JSON fields when the discovery index fills.
+- Leave **Target site map** off by default. Enable it in **Sources** when needed.
+- Open responses up to 6 MiB automatically and load larger responses on demand.
+- Read user labels alongside other lines in Proxy notes. The Users view shows labels and record counts and reads the current project locally.
+
 ## 1.1.0
 
 - Highlight the originating user in the **User** column when searching from a labeled HTTP message. The highlight applies to matching user labels on the same host.

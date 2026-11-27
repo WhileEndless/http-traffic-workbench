@@ -1,6 +1,6 @@
 # HTTP Traffic Workbench
 
-**v1.1.0** · [GitHub releases](https://github.com/WhileEndless/http-traffic-workbench/releases) · [WhileEndless](https://github.com/WhileEndless)
+**v1.2.0** · [GitHub releases](https://github.com/WhileEndless/http-traffic-workbench/releases) · [WhileEndless](https://github.com/WhileEndless)
 
 **What value did this field have for another user?** Select a value in a Burp request or response and choose **Search traffic for selection**. HTTP Traffic Workbench finds where that value appeared and surfaces comparable values already observed in other exchanges.
 
@@ -22,6 +22,7 @@ Select any result to inspect the original request and response. The search runs 
 - **Search across formats.** Search field names, values, or plain text across query parameters, headers, cookies, forms, JSON, XML, HTML, and JavaScript. Auto uses the selected message for context and ranks exact matches above comparable values.
 - **Search the sources you select.** Use Proxy history, Target Site Map, Scanner issue evidence, supported Organizer items, and imported traffic. Enable capture to include new traffic from tools such as Scanner, Repeater, Intruder, and extensions. Older Logger traffic can be added from selected messages or a Logger CSV export.
 - **Track users by session.** Select a login exchange, choose where to read the user identifier, and pick the session cookie. Preview which Proxy history records would receive the user label. Save the rule to the project or export it for another project. Search also works without user labels.
+- **Find captured users.** Open **Users** to search labels found in Proxy notes and the archive. Select a user to browse their traffic, or use **User filter** from a search.
 
 ## Install
 

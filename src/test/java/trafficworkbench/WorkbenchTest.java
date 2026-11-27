@@ -598,6 +598,381 @@ final class WorkbenchTest {
     }
 
     @Test
+    void followsDifferentStringsAtTheSameJsonPathFromSelectionAndHistory() {
+        String path = "/library/editions";
+        String seed = "AZ-8";
+        String value = "North Annex";
+        var selected = request("POST", path, "{\"edition\":{\"shelfCode\":\"AZ-8\"}}",
+                "application/json", Map.of(), HOST);
+        var origin = CapturedEntry.of("", exchange(selected, null));
+        var target = CapturedEntry.of("", exchange(request("POST", path,
+                "{\"edition\":{\"shelfCode\":\"North Annex\"},\"warehouse\":{\"shelfCode\":\"unused label\"},"
+                        + "\"edition.shelfCode\":\"also unused\"}",
+                "application/json", Map.of(), HOST), null));
+        var elsewhere = CapturedEntry.of("", exchange(request("POST", "/library/returns",
+                "{\"edition\":{\"shelfCode\":\"other location\"}}",
+                "application/json", Map.of(), HOST), null));
+        var alias = CapturedEntry.of("", exchange(request("GET", "/library/receipt", "", null, Map.of(), HOST),
+                response("{\"storageName\":\"North Annex\"}", "application/json", Map.of())));
+
+        var matches = new ArrayList<ResultRow>();
+        var entries = List.of(target, elsewhere, alias, origin);
+        new ExtractEngine(entries, "", 1, false, ExtractEngine.Direction.BOTH, true, false, sink(matches))
+                .runAuto(seed, Set.of(), false);
+        assertEquals(Set.of("shelfCode", "storageName"), matches.stream().filter(row -> row.related)
+                .map(row -> row.key).collect(java.util.stream.Collectors.toSet()));
+        assertEquals(List.of(value, value), matches.stream().filter(row -> row.related).map(row -> row.value).toList());
+        assertTrue(matches.stream().anyMatch(row -> !row.related && row.value.equals(seed)));
+
+        matches.clear();
+        new ExtractEngine(entries.subList(0, 3), CapturedEntry.endpoint(selected), 1, false,
+                ExtractEngine.Direction.BOTH, true, false, sink(matches))
+                .runValueFromContext(seed, HttpSearchFields.collect(origin.requestResponse(), true));
+        assertEquals(List.of(value, value), matches.stream().map(row -> row.value).toList());
+
+        matches.clear();
+        new ExtractEngine(entries, "", 0, false, ExtractEngine.Direction.BOTH, true, false, sink(matches))
+                .runAuto(seed, Set.of(), false);
+        assertEquals(List.of(seed), matches.stream().map(row -> row.value).toList());
+    }
+
+    @Test
+    void findsRelatedJsonFieldsInBothDirectionsAcrossDifferentEnvelopes() {
+        String path = "/warehouse/assignments";
+        String type = "application/json";
+        var outbound = request("POST", path, "{\"draft\":{\"rackMarker\":\"West Annex\",\"id\":\"73JF401\"}}",
+                type, Map.of(), HOST);
+        var inbound = response("{\"view\":{\"record\":{\"rackMarker\":\"Main Depot\",\"id\":\"84QM62\"}}}", type, Map.of());
+        var exchange = exchange(outbound, inbound);
+        var current = CapturedEntry.of("", exchange);
+        var rows = new ArrayList<ResultRow>();
+        var records = List.of(current);
+
+        new ExtractEngine(records, CapturedEntry.endpoint(outbound), 1, false, ExtractEngine.Direction.BOTH,
+                true, false, sink(rows)).runAutoFromContext("West Annex", HttpSearchFields.collect(exchange, true), false);
+        assertTrue(rows.stream().anyMatch(row -> row.related && row.source.equals("Response")
+                && row.key.equals("rackMarker") && row.value.equals("Main Depot")));
+        rows.clear();
+        new ExtractEngine(records, CapturedEntry.endpoint(outbound), 1, false, ExtractEngine.Direction.BOTH,
+                true, false, sink(rows)).runAutoFromContext("Main Depot", HttpSearchFields.collect(exchange, false), false);
+        assertTrue(rows.stream().anyMatch(row -> row.related && row.source.equals("Request")
+                && row.key.equals("rackMarker") && row.value.equals("West Annex")));
+        rows.clear();
+        new ExtractEngine(records, CapturedEntry.endpoint(outbound), 1, false, ExtractEngine.Direction.RESPONSE,
+                true, false, sink(rows)).runValueFromContext(
+                        "West Annex", HttpSearchFields.collect(exchange, true), CaptureProfile.Source.REQUEST);
+        assertEquals(List.of("Main Depot"), rows.stream().map(row -> row.value).toList());
+        rows.clear();
+        new ExtractEngine(records, "", 1, false, ExtractEngine.Direction.BOTH,
+                true, false, sink(rows)).runAuto("73JF401", Set.of(), false);
+        assertFalse(rows.stream().anyMatch(row -> row.related && row.key.equals("id")));
+    }
+
+    @Test
+    void followsCrossEndpointIdentifiersAndRelatedSubstringsWithTokenBoundaries() {
+        String type = "application/json";
+        var origin = CapturedEntry.of("", exchange(request("POST", "/warehouse/assignments",
+                "{\"draft\":{\"rackMarker\":\"82VW913\"}}", type, Map.of(), HOST), null));
+        var candidate = CapturedEntry.of("", exchange(request("GET", "/warehouse/racks", "", null, Map.of(), HOST),
+                response("{\"view\":{\"rack\":{\"rackMarker\":\"19NZ48\"}}}", type, Map.of())));
+        var mentions = CapturedEntry.of("", exchange(request("GET", "/warehouse/report", "", null, Map.of(), HOST),
+                response("{\"message\":\"Loaded rack (19NZ48).\",\"concatenated\":\"X19NZ48Y\","
+                        + "\"printedMarker\":\"19NZ48\"}", type, Map.of())));
+        var external = CapturedEntry.of("", exchange(request("GET", "/warehouse/racks", "", null, Map.of(), "outside.example.test"),
+                response("{\"view\":{\"rackMarker\":\"63BX27\"}}", type, Map.of())));
+        var rows = new ArrayList<ResultRow>();
+        for (boolean partialMatches : List.of(true, false)) {
+            rows.clear();
+            new ExtractEngine(List.of(mentions, external, candidate, origin), "", 1, false, ExtractEngine.Direction.BOTH,
+                    partialMatches, false, sink(rows)).runAuto("82VW913", Set.of(), false);
+            assertTrue(rows.stream().anyMatch(row -> row.related && row.key.equals("rackMarker")
+                    && row.value.equals("19NZ48")));
+            assertTrue(rows.stream().anyMatch(row -> row.related && row.key.equals("printedMarker")));
+            assertEquals(partialMatches, rows.stream().anyMatch(row -> row.related && row.key.equals("message")
+                    && row.editorSearch.equals("19NZ48")));
+            assertFalse(rows.stream().anyMatch(row -> row.key.equals("concatenated") || row.entry == external));
+        }
+    }
+
+    @Test
+    void findsMatchingJsonPathsAfterTheGeneralDiscoveryIndexFills() {
+        String endpoint = "/library/reservations";
+        var request = request("POST", endpoint, "{\"reservation\":{\"deskCode\":\"Foyer-835\"}}",
+                "application/json", Map.of(), HOST);
+        var seed = CapturedEntry.of("", exchange(request, null));
+        var candidate = CapturedEntry.of("", exchange(request("POST", endpoint,
+                "{\"reservation\":{\"deskCode\":\"Gallery-17\"}}", "application/json", Map.of(), HOST), null));
+        var alias = CapturedEntry.of("", exchange(request("GET", "/library/summary", "", null, Map.of(), HOST),
+                response("{\"assignedDesk\":\"Gallery-17\",\"notice\":\"Reserved (Gallery-17).\"}",
+                        "application/json", Map.of())));
+        var alternateResponse = CapturedEntry.of("", exchange(request("GET", "/library/desks", "", null, Map.of(), HOST),
+                response("{\"view\":{\"deskCode\":\"Atrium-92\"}}", "application/json", Map.of())));
+        var beforeLimit = CapturedEntry.of("", exchange(request("POST", endpoint,
+                "{\"reservation\":{\"deskCode\":\"Studio-52\"}}", "application/json", Map.of(), HOST), null));
+        String padding = "p".repeat(1_950);
+        String body = "{\"filler\":[" + String.join(",", java.util.Collections.nCopies(850, '"' + padding + '"')) + "]}";
+        var unrelated = CapturedEntry.of("", exchange(request("POST", "/background", body, "application/json",
+                Map.of(), HOST), null));
+        var records = new ArrayList<>(java.util.Collections.nCopies(8, unrelated));
+        records.add(0, beforeLimit);
+        records.addAll(List.of(candidate, alias, alternateResponse, seed));
+        var rows = new ArrayList<ResultRow>();
+        var engine = new ExtractEngine(records, "", 1, false, ExtractEngine.Direction.BOTH, true, false, sink(rows));
+        engine.runAuto("Foyer-835", Set.of(), false);
+        assertTrue(engine.discoveryLimited());
+        assertEquals(List.of("Studio-52", "Gallery-17", "Atrium-92"),
+                rows.stream().filter(row -> row.related && row.key.equals("deskCode"))
+                .map(row -> row.value).toList());
+        assertEquals(List.of("Gallery-17"), rows.stream().filter(row -> row.related && row.key.equals("assignedDesk"))
+                .map(row -> row.value).toList());
+        assertTrue(rows.stream().anyMatch(row -> row.related && row.key.equals("notice")
+                && row.editorSearch.equals("Gallery-17")));
+    }
+
+    @Test
+    void followsExactFieldAliasesAcrossJsonHtmlFormsXmlAndJavaScript() {
+        var start = request("POST", "/studio/register", "{\"inventoryTag\":\"Start item\"}",
+                "application/json", Map.of(), HOST);
+        var seed = CapturedEntry.of("", exchange(start, null));
+        var html = CapturedEntry.of("", exchange(request("GET", "/studio/form", "", null, Map.of(), HOST),
+                response("<input name=\"equipmentRef\" value=\"Start item\">", "text/html", Map.of())));
+        var form = CapturedEntry.of("", exchange(request("POST", "/studio/submit", "equipmentRef=Lantern+case",
+                "application/x-www-form-urlencoded", Map.of(), HOST), null));
+        var xml = CapturedEntry.of("", exchange(request("GET", "/studio/catalog", "", null, Map.of(), HOST),
+                response("<entry><catalogHandle>Lantern case</catalogHandle></entry>", "application/xml", Map.of())));
+        var script = CapturedEntry.of("", exchange(request("GET", "/studio/include.js", "", null, Map.of(), HOST),
+                response("const catalogHandle = 'Night shift';", "application/javascript", Map.of())));
+        var multipart = CapturedEntry.of("", exchange(request("POST", "/studio/print",
+                "--d\r\nContent-Disposition: form-data; name=\"printedHandle\"\r\n\r\nNight shift\r\n--d--\r\n",
+                "multipart/form-data; boundary=d", Map.of(), HOST), null));
+        var external = CapturedEntry.of("", exchange(request("POST", "/other/submit", "equipmentRef=Unrelated",
+                "application/x-www-form-urlencoded", Map.of(), "other.example.test"), null));
+        var entries = List.of(form, multipart, script, xml, html, external, seed);
+        String padding = '"' + "x".repeat(1_950) + '"';
+        String filler = "{\"filler\":[" + String.join(",", java.util.Collections.nCopies(850, padding)) + "]}";
+        var noise = CapturedEntry.of("", exchange(request("POST", "/background", filler,
+                "application/json", Map.of(), HOST), null));
+        var large = new ArrayList<>(java.util.Collections.nCopies(8, noise));
+        large.addAll(entries);
+        for (var input : List.of(entries, large)) {
+            var results = new ArrayList<ResultRow>();
+            new ExtractEngine(input, CapturedEntry.endpoint(start), 3, false, ExtractEngine.Direction.BOTH,
+                    false, false, sink(results)).runAutoFromContext(
+                            "Start item", HttpSearchFields.collect(seed.requestResponse(), true), false);
+            assertTrue(results.stream().anyMatch(row -> row.entry == html && !row.related && row.key.equals("equipmentRef")));
+            assertTrue(results.stream().anyMatch(row -> row.entry == form && row.related && row.value.equals("Lantern+case")));
+            assertTrue(results.stream().anyMatch(row -> row.entry == xml && row.related && row.key.equals("catalogHandle")));
+            assertTrue(results.stream().anyMatch(row -> row.entry == script && row.related && row.value.equals("Night shift")));
+            assertTrue(results.stream().anyMatch(row -> row.entry == multipart && row.related && row.key.equals("printedHandle")));
+            assertFalse(results.stream().anyMatch(row -> row.entry == external));
+        }
+    }
+
+    @Test
+    void followsDeviceNumbersBetweenJsonScalarsAndTextInFormsAndXml() {
+        var start = request("POST", "/shop/order", "{\"machineNumber\":70842}", "application/json", Map.of(), HOST);
+        var form = request("POST", "/shop/receipt", "receiptNumber=70842", "application/x-www-form-urlencoded", Map.of(), HOST);
+        var changed = request("POST", "/shop/entries", "{\"receiptNumber\":92}", "application/json", Map.of(), HOST);
+        var xml = response("<entry><displayNumber>92</displayNumber></entry>", "application/xml", Map.of());
+        var records = List.of(CapturedEntry.of("", exchange(start, null)), CapturedEntry.of("", exchange(form, null)),
+                CapturedEntry.of("", exchange(changed, xml)));
+        var results = new ArrayList<ResultRow>();
+        new ExtractEngine(records, CapturedEntry.endpoint(start), 3, false, ExtractEngine.Direction.BOTH, false, false, sink(results))
+                .runAutoFromContext("\"70842\"", HttpSearchFields.collect(records.get(0).requestResponse(), true), false);
+        assertTrue(results.stream().anyMatch(row -> !row.related && row.key.equals("receiptNumber") && row.value.equals("70842")));
+        assertTrue(results.stream().anyMatch(row -> row.related && row.key.equals("receiptNumber") && row.value.equals("92")));
+        assertTrue(results.stream().anyMatch(row -> row.related && row.key.equals("displayNumber") && row.value.equals("92")));
+    }
+
+    @Test
+    void followsThreeExactFieldLinksThroughNewJsonValues() {
+        String type = "application/json";
+        var queue = request("POST", "/museum/queue", "{\"arrival\":{\"routeName\":\"Hall map\"}}", type, Map.of(), HOST);
+        var origin = CapturedEntry.of("", exchange(queue, null));
+        var entries = List.of(
+                origin,
+                CapturedEntry.of("", exchange(request("POST", "/museum/queue",
+                        "{\"arrival\":{\"routeName\":\"Quiet wing\"}}", type, Map.of(), HOST), null)),
+                CapturedEntry.of("", exchange(request("GET", "/museum/guides", "", null, Map.of(), HOST),
+                        response("{\"guide\":{\"guideAlias\":\"Quiet wing\"}}", type, Map.of()))),
+                CapturedEntry.of("", exchange(request("GET", "/museum/guides", "", null, Map.of(), HOST),
+                        response("{\"guide\":{\"guideAlias\":\"Moonlight tour\"}}", type, Map.of()))),
+                CapturedEntry.of("", exchange(request("GET", "/museum/tickets", "", null, Map.of(), HOST),
+                        response("{\"reservation\":{\"ticketLabel\":\"Moonlight tour\"}}", type, Map.of()))),
+                CapturedEntry.of("", exchange(request("GET", "/museum/tickets", "", null, Map.of(), HOST),
+                        response("{\"reservation\":{\"ticketLabel\":\"Garden event\"}}", type, Map.of()))),
+                CapturedEntry.of("", exchange(request("GET", "/museum/events", "", null, Map.of(), HOST),
+                        response("{\"eventTitle\":\"Garden event\"}", type, Map.of()))));
+        String padding = '"' + "x".repeat(1_950) + '"';
+        String filler = "{\"filler\":[" + String.join(",", java.util.Collections.nCopies(850, padding)) + "]}";
+        var noise = CapturedEntry.of("", exchange(request("POST", "/background", filler, type, Map.of(), HOST), null));
+        var large = new ArrayList<>(java.util.Collections.nCopies(8, noise));
+        large.addAll(entries);
+        for (var input : List.of(entries, large)) {
+            for (int depth : List.of(1, 2, 3)) {
+                var rows = new ArrayList<ResultRow>();
+                new ExtractEngine(input, "", depth, false, ExtractEngine.Direction.BOTH, false, false, sink(rows))
+                        .runAuto("Hall map", Set.of(), false);
+                assertTrue(rows.stream().anyMatch(row -> row.related && row.key.equals("guideAlias")
+                        && row.value.equals("Quiet wing")));
+                assertEquals(depth >= 2, rows.stream().anyMatch(row -> row.related && row.key.equals("ticketLabel")
+                        && row.value.equals("Moonlight tour")));
+                assertEquals(depth >= 3, rows.stream().anyMatch(row -> row.related && row.key.equals("eventTitle")
+                        && row.value.equals("Garden event")));
+            }
+        }
+    }
+
+    @Test
+    void followsOtherValuesFromAJsonFieldLearnedByPartialMatch() {
+        String type = "application/json";
+        var origin = CapturedEntry.of("", exchange(request("POST", "/library/requests",
+                "{\"lookupTag\":\"Starting point\"}", type, Map.of(), HOST), null));
+        var candidate = CapturedEntry.of("", exchange(request("POST", "/library/requests",
+                "{\"lookupTag\":\"Folder-N304\"}", type, Map.of(), HOST), null));
+        var embedded = CapturedEntry.of("", exchange(request("GET", "/library/groups", "", null, Map.of(), HOST),
+                response("{\"inventory\":{\"shelfMarker\":\"Placed (Folder-N304).\"}}", type, Map.of())));
+        var alternate = CapturedEntry.of("", exchange(request("GET", "/library/groups", "", null, Map.of(), HOST),
+                response("{\"inventory\":{\"shelfMarker\":\"South store\"}}", type, Map.of())));
+        var target = CapturedEntry.of("", exchange(request("GET", "/library/locations", "", null, Map.of(), HOST),
+                response("{\"destinationName\":\"South store\",\"unlinked\":\"Placed (Folder-N304).\"}", type, Map.of())));
+        var entries = List.of(target, alternate, embedded, candidate, origin);
+        var rows = new ArrayList<ResultRow>();
+        new ExtractEngine(entries, "", 2, false, ExtractEngine.Direction.BOTH, true, false, sink(rows))
+                .runAuto("Starting point", Set.of(), false);
+        assertTrue(rows.stream().anyMatch(row -> row.related && row.key.equals("shelfMarker")
+                && row.reason.startsWith("Partial related value")));
+        assertTrue(rows.stream().anyMatch(row -> row.related && row.key.equals("destinationName")
+                && row.reason.contains("(level 2)")));
+        assertFalse(rows.stream().anyMatch(row -> row.key.equals("unlinked") && row.reason.contains("(level 2)")));
+    }
+
+    @Test
+    void treatsQuotedAndUnquotedDecimalIntegersEquallyAndFollowsShorterValues() {
+        String path = "/dispatch/queue";
+        var text = CapturedEntry.of("", exchange(request("POST", path, "{\"queueNumber\":\"71408\"}",
+                "application/json", Map.of(), HOST), null));
+        var number = CapturedEntry.of("", exchange(request("POST", path, "{\"queueNumber\":71408}",
+                "application/json", Map.of(), HOST), null));
+        var shorter = CapturedEntry.of("", exchange(request("POST", path, "{\"queueNumber\":27}",
+                "application/json", Map.of(), HOST), null));
+        var textAlias = CapturedEntry.of("", exchange(request("GET", "/dispatch/label", "", null, Map.of(), HOST),
+                response("{\"printedNumber\":\"27\"}", "application/json", Map.of())));
+        var unrelated = CapturedEntry.of("", exchange(request("POST", path, "{\"queueNumber\":84.5}",
+                "application/json", Map.of(), HOST), null));
+        var padded = CapturedEntry.of("", exchange(request("POST", path, "{\"queueNumber\":\"071408\"}",
+                "application/json", Map.of(), HOST), null));
+        var entries = List.of(shorter, textAlias, unrelated, padded, text, number);
+
+        for (String query : List.of("71408", "\"71408\"")) {
+            for (boolean auto : List.of(true, false)) {
+                var matches = new ArrayList<ResultRow>();
+                var engine = new ExtractEngine(entries, "", 1, false, ExtractEngine.Direction.BOTH,
+                        false, false, sink(matches));
+                if (auto) engine.runAuto(query, Set.of(), false);
+                else engine.runValueFromContext(query, List.of());
+                assertEquals(List.of("71408", "71408"), matches.stream().filter(row -> !row.related && !row.key.isEmpty())
+                        .map(row -> row.value).toList());
+                assertTrue(matches.stream().anyMatch(row -> row.related && row.key.equals("queueNumber")
+                        && row.value.equals("071408")));
+                assertTrue(matches.stream().anyMatch(row -> row.related && row.key.equals("queueNumber") && row.value.equals("27")));
+                assertTrue(matches.stream().anyMatch(row -> row.related && row.key.equals("printedNumber") && row.value.equals("27")));
+                assertFalse(matches.stream().anyMatch(row -> row.value.equals("84.5")));
+            }
+        }
+    }
+
+    @Test
+    void showsUserLabelsFromAnyLineOfAnExistingNote() {
+        var request = request("GET", "/library", "", null, Map.of(), HOST);
+        var exchange = exchange(request, null);
+        var profile = CaptureProfile.defaults();
+        var records = new ArrayList<CapturedEntry>();
+        for (String note : List.of("User: sample-one\nReviewed", "Checked\r\n  User Code: sample-two\r\nKeep note",
+                "Pending\nUserCode: sample-three")) {
+            records.add(TrafficCatalog.record(exchange, annotations(note), TIME, TrafficSource.PROXY, 8080, profile));
+        }
+        var rows = new ArrayList<ResultRow>();
+        new ExtractEngine(records, "", 0, false, ExtractEngine.Direction.BOTH, false, false, sink(rows)).browse();
+        assertEquals(List.of("sample-one", "sample-two", "sample-three"), rows.stream().map(row -> row.userCode).toList());
+    }
+
+    @Test
+    void listsLocalUsersAndBrowsesOnlyTheSelectedLabel() throws Exception {
+        var req = request("GET", "/library/entries", "", null, Map.of(), HOST);
+        var history = List.of(history(req, null, "Checklist\nUser: Cedar-04\nReady", TIME),
+                history(req, null, "User: Maple-07", TIME + 1), history(req, null, "Other note", TIME + 2));
+        var proxy = mock(burp.api.montoya.proxy.Proxy.class, (name, args) -> history);
+        var ui = offscreenUi();
+        var api = mock(MontoyaApi.class, (name, args) -> name.equals("proxy") ? proxy : ui);
+        var store = new CollectorStore(persistence());
+        var scans = new ScanQueue();
+        var search = new AtomicReference<SearchPanel>();
+        var directory = new AtomicReference<UserDirectoryPanel>();
+        var loaded = new java.util.concurrent.CountDownLatch(1);
+        var complete = new java.util.concurrent.CountDownLatch(1);
+        try {
+            store.add(CapturedEntry.of("Cedar-04", exchange(req, null), TIME, TrafficSource.REPEATER, 0, false));
+            var catalog = new TrafficCatalog(api, store);
+            assertEquals(List.of(new TrafficCatalog.UserCount("Cedar-04", 2),
+                    new TrafficCatalog.UserCount("Maple-07", 1)), catalog.users(CaptureProfile.defaults(), () -> false).entries());
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                var action = new javax.swing.JButton("Browse user traffic");
+                var view = new UserDirectoryPanel(catalog, CaptureProfile::defaults, action);
+                directory.set(view);
+                var table = find(view, javax.swing.JTable.class);
+                table.getModel().addTableModelListener(event -> loaded.countDown());
+                view.refresh("");
+            });
+            assertTrue(loaded.await(3, java.util.concurrent.TimeUnit.SECONDS));
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                var view = directory.get();
+                assertEquals(2, find(view, javax.swing.JTable.class).getColumnCount());
+                find(view, javax.swing.JTextField.class).setText("mAp");
+                var table = find(view, javax.swing.JTable.class);
+                assertEquals(1, table.getRowCount());
+                table.setRowSelectionInterval(0, 0);
+                render(view, 420, 300, "users-narrow");
+                assertEquals("Maple-07", view.selectedUser());
+
+                var panel = new SearchPanel(api, store, scans, CaptureProfile::defaults, ExtractDialog.Dataset.HISTORY,
+                        ExtractDialog.Context.forUser(view.selectedUser()), () -> {});
+                search.set(panel);
+                button(panel, "Stop").addPropertyChangeListener("enabled", event -> {
+                    if (Boolean.FALSE.equals(event.getNewValue())) complete.countDown();
+                });
+                panel.searchSelection();
+            });
+            assertTrue(complete.await(3, java.util.concurrent.TimeUnit.SECONDS));
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                var table = find(search.get(), javax.swing.JTable.class);
+                assertEquals(1, table.getRowCount());
+                assertEquals("Maple-07", table.getValueAt(0, 1));
+            });
+        } finally {
+            javax.swing.SwingUtilities.invokeAndWait(() -> {
+                if (search.get() != null) search.get().close();
+                if (directory.get() != null) directory.get().cancel();
+            });
+            scans.close();
+            store.flushAndShutdown();
+        }
+    }
+
+    @Test
+    void leavesSiteMapOffByDefaultAndAllowsExplicitSelection() {
+        var defaults = ExtractDialog.Dataset.ALL.sources();
+        assertTrue(defaults.contains(TrafficSource.PROXY));
+        assertTrue(defaults.contains(TrafficSource.REPEATER));
+        assertFalse(defaults.contains(TrafficSource.SITE_MAP));
+        var allowed = java.util.EnumSet.allOf(TrafficSource.class);
+        var picker = new SourcePicker("Sources", allowed, defaults);
+        assertFalse(picker.selected().contains(TrafficSource.SITE_MAP));
+        picker.select(allowed);
+        assertTrue(picker.selected().contains(TrafficSource.SITE_MAP));
+    }
+
+    @Test
     void learnsNumericAliasesWithoutDumpingLoggingFieldsOrUnrelatedValues() {
         // Consecutive synthetic IDs preserve the numeric width across all message formats.
         String searched = "10000001";
@@ -1792,13 +2167,17 @@ final class WorkbenchTest {
         });
         var api = mock(MontoyaApi.class, (name, args) -> ui);
         var request = request("GET", "/large", "", null, Map.of(), HOST);
-        var response = response("x".repeat(2 * 1024 * 1024 + 1), "text/plain", Map.of());
+        var previewable = response("x".repeat(5 * 1024 * 1024), "text/plain", Map.of());
+        var response = response("x".repeat(6 * 1024 * 1024 + 1), "text/plain", Map.of());
         javax.swing.SwingUtilities.invokeAndWait(() -> {
             var view = new ExchangeView(api);
-            view.show(exchange(request, response), "x");
-            assertNull(loaded.get());
             var button = button(view.component(), "Load full response");
             assertNotNull(button);
+            view.show(exchange(request, previewable), "x");
+            assertSame(previewable, loaded.get());
+            assertFalse(button.isVisible());
+            view.show(exchange(request, response), "x");
+            assertSame(previewable, loaded.get());
             assertTrue(button.isVisible());
             button.doClick();
             assertSame(response, loaded.get());
@@ -2308,8 +2687,15 @@ final class WorkbenchTest {
                     assertTrue(button(component, "Project settings…").isEnabled());
                     assertTrue(button(component, "Trace a cookie…").isEnabled());
                     assertTrue(button(component, "Info").isEnabled());
-                    assertEquals("v1.1.0", BuildInfo.release());
+                    assertEquals("v1.2.0", BuildInfo.release());
+                    var views = find(component, javax.swing.JTabbedPane.class,
+                            pane -> pane.indexOfTab("Users") >= 0);
+                    assertEquals("Archive", views.getTitleAt(views.getSelectedIndex()));
                     render(component, 1050, 700, "archive");
+                    views.setSelectedIndex(views.indexOfTab("Users"));
+                    render(component, 1050, 700, "users-tab");
+                    assertNotNull(button(views.getSelectedComponent() instanceof java.awt.Container users
+                            ? users : component, "Browse user traffic"));
                 } finally {
                     tab.close();
                     menu.close();
@@ -2377,6 +2763,7 @@ final class WorkbenchTest {
                     assertTrue(submit.x - (q.x + q.width) >= 10);
                     assertTrue(reset.x - (submit.x + submit.width) >= 6);
                     var sources = find(search, SourcePicker.class);
+                    assertEquals(3, find(search, javax.swing.JSpinner.class).getValue());
                     var sourceBounds = javax.swing.SwingUtilities.convertRectangle(sources.getParent(), sources.getBounds(), search);
                     assertTrue(sourceBounds.y - (q.y + q.height) >= 10);
                     var host = find(search, javax.swing.JCheckBox.class, box -> box.getText().equals("Same host"));
@@ -2393,7 +2780,7 @@ final class WorkbenchTest {
                     render(info, preferred.width, preferred.height, "info");
                     assertTrue(hasLabel(info, "WhileEndless"));
                     assertTrue(hasLabel(info, "http-traffic-workbench"));
-                    assertTrue(hasLabel(info, "Version v1.1.0"));
+                    assertTrue(hasLabel(info, "Version v1.2.0"));
                     assertNotNull(button(info, "Open repository"));
                     assertNotNull(button(info, "Copy repository URL"));
 

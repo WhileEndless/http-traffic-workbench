@@ -10,7 +10,8 @@ import javax.swing.*;
 import java.awt.*;
 
 final class ExchangeView {
-    private static final int MAX_PREVIEW_BYTES = 2 * 1024 * 1024;
+    private static final int MAX_REQUEST_PREVIEW_BYTES = 2 * 1024 * 1024;
+    private static final int MAX_RESPONSE_PREVIEW_BYTES = 6 * 1024 * 1024;
     private static final int MAX_HIGHLIGHT_BYTES = 1024 * 1024;
 
     private final HttpRequestEditor request;
@@ -102,12 +103,12 @@ final class ExchangeView {
         }
         String requestTerm = requestBytes > 0 && requestBytes <= MAX_HIGHLIGHT_BYTES ? requestMatch : "";
         String responseTerm = responseBytes > 0 && responseBytes <= MAX_HIGHLIGHT_BYTES ? responseMatch : "";
-        if (requestBytes > 0 && requestBytes <= MAX_PREVIEW_BYTES
+        if (requestBytes > 0 && requestBytes <= MAX_REQUEST_PREVIEW_BYTES
                 && (!requestTerm.equals(requestSearch) || messageChanged && !requestTerm.isEmpty())) {
             requestSearch = requestTerm;
             request.setSearchExpression(requestTerm);
         }
-        if (responseBytes > 0 && responseBytes <= MAX_PREVIEW_BYTES
+        if (responseBytes > 0 && responseBytes <= MAX_RESPONSE_PREVIEW_BYTES
                 && (!responseTerm.equals(responseSearch) || messageChanged && !responseTerm.isEmpty())) {
             responseSearch = responseTerm;
             response.setSearchExpression(responseTerm);
@@ -119,17 +120,17 @@ final class ExchangeView {
         var res = exchange == null ? null : exchange.response();
         requestBytes = req == null ? 0 : req.toByteArray().length();
         responseBytes = res == null ? 0 : res.toByteArray().length();
-        loadRequest.setVisible(req != null && requestBytes > MAX_PREVIEW_BYTES);
-        loadResponse.setVisible(res != null && responseBytes > MAX_PREVIEW_BYTES);
+        loadRequest.setVisible(req != null && requestBytes > MAX_REQUEST_PREVIEW_BYTES);
+        loadResponse.setVisible(res != null && responseBytes > MAX_RESPONSE_PREVIEW_BYTES);
 
-        if (req != null && requestBytes <= MAX_PREVIEW_BYTES) {
+        if (req != null && requestBytes <= MAX_REQUEST_PREVIEW_BYTES) {
             request.setRequest(req);
             requestLayout.show(requestCards, "editor");
         } else {
             requestStatus.setText(req == null ? "Select a record." : "The request exceeds the preview limit.");
             requestLayout.show(requestCards, "status");
         }
-        if (res != null && responseBytes <= MAX_PREVIEW_BYTES) {
+        if (res != null && responseBytes <= MAX_RESPONSE_PREVIEW_BYTES) {
             response.setResponse(res);
             responseLayout.show(responseCards, "editor");
         } else {

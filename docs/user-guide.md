@@ -26,7 +26,13 @@ Build from source with JDK 17 or later and Maven. Run `mvn clean package` to run
 2. Enter a term and press **Enter** or click **Search**. Use **Browse traffic** to list records with an empty query. Opening search with no text selection leaves the query empty. **Auto** searches field names, values, and plain text. The message selection provides field context when available.
 3. Direct matches and comparable values from fields identified by the selected message appear as the scan runs. The status shows how many records have been read. Links that need evidence from other records can appear later. If a value matches on both sides, the request and response each get a row. Selecting a row opens the exchange and highlights its own side. **Value** preserves the original spelling of URL-encoded form values. Select **Load full response** for oversized responses. The message editor search bars use the original spelling of matched form names and values, including percent escapes. **All matches** shows direct results first and related results below. Use **Direct matches** or **Related fields** to focus the view. **Copy page** copies the visible page. **Stop** keeps the matches already shown.
 
-**Depth** defaults to **1**. In **Auto**, selecting a key in a structured message searches for the key both as a field name and as a literal value. Its paired value can then lead to other fields, even when the source message is outside the selected traffic sources. Selecting the value does the reverse. For example, from `customerRef=demo-7428`, Auto can find `targetField=customerRef` and a response field `reference` containing `demo-7428`.
+Select **User filter**, type part of a label, select a user, and click **Apply**. The filter searches traffic with that exact label within the selected sources and other filters. Select **All users** to clear it.
+
+**Depth** defaults to **3**. In **Auto**, selecting a key in a structured message searches for the key both as a field name and as a literal value. Its paired value can then lead to other fields, even when the source message is outside the selected traffic sources. Selecting the value does the reverse. For example, from `customerRef=demo-7428`, Auto can find `targetField=customerRef` and a response field `reference` containing `demo-7428`. When an exact match or a partial match in a distinctive JSON field establishes a link, other compatible values at that endpoint and JSON path can lead to further fields.
+
+**Auto** and **Field value** use the JSON path and endpoint learned from a matching JSON field to find other strings or integers in that field. A distinctive field name can also connect request and response fields at the same endpoint when their JSON paths differ. Across endpoints on the same host, a matching field name and identifier shape can establish that link. A string containing the standard decimal spelling of an integer can also match an integer in the field. Searching for `71408` or `"71408"` finds both JSON spellings as direct matches. Related values can lead to exact matches in other fields. With **Partial value matches** enabled, they can also match within a longer field value at token boundaries.
+
+A distinctive field name learned from an exact shared value can reveal other compatible values from that field on the same host. The chain can move between JSON, XML, HTML controls, static JavaScript fields, and URL-encoded or multipart forms. Decimal integers and their text spellings can participate in the same chain.
 
 When a search starts from an HTTP message with a known user label, results for the same user and host display the label in an accent color in the **User** column.
 
@@ -44,7 +50,7 @@ The highest scores go to exact field-and-value matches. Standalone exact values 
 
 ### Traffic sources
 
-Use **Sources** to switch individual sources on or off. The menu has **All** and **None** actions. When results are open, changing sources refreshes the search once after the menu closes. The **Tool** column identifies the origin and **Side** shows whether the match was in the request or response.
+Use **Sources** to switch individual sources on or off. **Target site map** starts off and can be enabled from this menu. The menu has **All** and **None** actions. When results are open, changing sources refreshes the search once after the menu closes. The **Tool** column identifies the origin and **Side** shows whether the match was in the request or response.
 
 **Same host** is checked by default in the main search controls. It uses the hostname of the HTTP message that opened the search and includes that host across paths, ports, and protocols. In a search opened from the suite tab, select a result to choose the host for the next search. Clear **Same host** to search across hosts.
 
@@ -73,6 +79,12 @@ Burp's **Logger** is the place to inspect older traffic from every tool. The pub
 - **HTML** includes input and output controls, textareas, select options, meta fields, and `data-*` attributes. HTML control IDs are searchable directly. A submitted name provides the field context on a value match. An explicitly searched ID can also lead to related values. Structured JSON fields are also extracted from script blocks, quoted attributes, and visible text such as a `pre` block. Embedded scanning uses a separate 1 MiB text budget per message.
 - **JavaScript** includes static literals in script responses, inline scripts, and event attributes. Dynamic expressions are searchable as source text. Script files become searchable when they appear in Proxy history.
 - **Plain text** includes HTTP headers, request paths, queries, and decoded bodies. Auto also recognizes simple `name=value` and `name: value` lines. The extension supports gzip, deflate, and declared body character sets. Formats without a field parser, including opaque binary bodies, use text search over the available body text.
+
+## Browse captured users
+
+Open **Users** on the main extension tab. The list reads user labels from Proxy history notes and the extension archive. It shows each label and its record count. Type in **Find user** to narrow the list, then select a row and click **Browse user traffic** to open a filtered search. Use **Refresh** to read newly captured or newly labeled records while the tab is open.
+
+The user directory runs locally and reads labels and counts. It creates no separate user file and includes no HTTP URLs, messages, or session cookies. User labels can still be sensitive. Share synthetic examples when reporting an issue.
 
 ## Trace a cookie
 
@@ -116,13 +128,15 @@ The offline walkthrough covers cross-format searches, related identifiers, and a
 
 Keep Burp projects, Logger exports, traffic screenshots, and project profiles outside the source tree or in the Git-ignored `local-data/` directory. Use synthetic messages and reserved `.test` hosts for examples and test fixtures.
 
+Archive exports and copied search rows are project data. They can include real URLs, user labels, cookies, or message contents. For a release, package the built JAR, its checksum, and release notes. Use synthetic examples for screenshots and bug reports.
+
 [PortSwigger · Montoya project persistence](https://portswigger.net/burp-but-yours/advanced-concepts/extensions/)
 
 ## Performance and limits
 
 Search, cookie tracing, and historical labeling share a low-priority, bounded background queue. Exact searches and cookie traces process records incrementally. Replacement tracking orders the scoped Proxy records before following changes. Cookie tracing reads HTTP headers without decoding message bodies. Result batches update one page at a time. Capture uses a separate bounded queue and archive writes are batched.
 
-- Search reads up to **4 MiB** of decoded body per message. Live Proxy notes use up to **256 KiB**. Messages up to **2 MiB** open automatically and larger messages can be loaded on demand. Automatic editor highlighting applies to messages up to **1 MiB** per side. A truncated structured body may yield fewer fields.
+- Search reads up to **4 MiB** of decoded body per message. Live Proxy notes use up to **256 KiB**. Requests up to **2 MiB** and responses up to **6 MiB** open automatically. Larger messages can be loaded on demand. Automatic editor highlighting applies to messages up to **1 MiB** per side. A truncated structured body may yield fewer fields.
 - Results use pages of **200** rows with up to **50,000** matches per search. Discovery has a separate index budget. Direct matching continues when the discovery budget runs out.
 - Historical labeling can plan up to **25,000** new notes in one pass. Apply them before running another preview for the remaining records.
 - The archive holds up to **2,000** samples or **32 MiB** of raw traffic. It retains up to ten distinct samples per user, service, and endpoint. A single sample can use up to **2 MiB**.

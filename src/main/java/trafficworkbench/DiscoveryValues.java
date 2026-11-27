@@ -13,6 +13,9 @@ final class DiscoveryValues {
     private static final Pattern WORD_BREAK = Pattern.compile("([a-z0-9])([A-Z])");
     private static final Pattern UUID = Pattern.compile("[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}");
     private static final Pattern CODE = Pattern.compile("[a-zA-Z0-9_./-]+");
+    private static final Pattern DECIMAL_INTEGER = Pattern.compile("-?(?:0|[1-9][0-9]*)");
+    private static final Pattern GENERIC_FIELD = Pattern.compile(
+            "(?i)(?:id|name|value|type|code|key|ref|reference|number|title|text|label|description|message|notice|data|content|result)");
     private static final Pattern LINK_TOKEN = Pattern.compile("_*[\\p{L}\\p{N}][\\p{L}\\p{N}_.@:+$/-]*");
     private static final Pattern LINK_TEXT = Pattern.compile(
             "[\\p{L}\\p{N}][\\p{L}\\p{N}\\p{M}\\p{Zs}.,@:+$/&'_-]*");
@@ -32,6 +35,32 @@ final class DiscoveryValues {
 
     static boolean calendarDate(String value) {
         return DateShape.of(value) != null;
+    }
+
+    static boolean decimalInteger(String value) {
+        return DECIMAL_INTEGER.matcher(value).matches();
+    }
+
+    static boolean distinctiveFieldName(String name) {
+        return name.length() >= 3 && !GENERIC_FIELD.matcher(name).matches();
+    }
+
+    static String identifierShape(String value) {
+        if (value.length() > 128 || !CODE.matcher(value).matches()) return "";
+        var shape = new StringBuilder();
+        char previous = 0;
+        boolean letters = false;
+        boolean digits = false;
+        for (int i = 0; i < value.length(); i++) {
+            char character = value.charAt(i);
+            char group = character >= 'A' && character <= 'Z' || character >= 'a' && character <= 'z'
+                    ? 'L' : isDigit(character) ? 'D' : character;
+            letters |= group == 'L';
+            digits |= group == 'D';
+            if (group != previous || group != 'L' && group != 'D') shape.append(group);
+            previous = group;
+        }
+        return letters && digits ? shape.toString() : "";
     }
 
     static Predicate<String> similarTo(String example) {

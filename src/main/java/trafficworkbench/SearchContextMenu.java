@@ -84,7 +84,7 @@ final class SearchContextMenu implements ContextMenuItemsProvider {
         var origin = tool == ToolType.PROXY ? TrafficSource.PROXY
                 : tool == ToolType.LOGGER ? TrafficSource.ARCHIVE : TrafficSource.forTool(tool);
         var selectedExchange = anchor == null ? null : new ExtractDialog.SelectedExchange(anchor, origin);
-        var context = new ExtractDialog.Context(selection, path, source, null, selectedExchange);
+        var context = new ExtractDialog.Context(selection, path, source, null, selectedExchange, anchorSide);
         JMenuItem menu = new JMenuItem(selection.isEmpty()
                 ? "HTTP Traffic Workbench · Search traffic…" : "HTTP Traffic Workbench · Search traffic for selection…");
         menu.addActionListener(eventClick -> open(ExtractDialog.Dataset.ALL, context));

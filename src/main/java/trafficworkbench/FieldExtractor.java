@@ -39,6 +39,17 @@ final class FieldExtractor {
 
     enum Kind { BODY, HEADER, COOKIE }
 
+    enum JsonScalar { STRING, INTEGER_STRING, INTEGER }
+
+    record JsonPath(JsonPath parent, String name, int length) {
+        private static final JsonPath ROOT = new JsonPath(null, null, 0);
+
+        JsonPath child(String name) {
+            int size = length + (name == null ? 0 : name.length()) + 1;
+            return size <= 1024 ? new JsonPath(this, name, size) : null;
+        }
+    }
+
     record FormToken(Charset charset, String name, String value) {}
 
     static final class Pair {
@@ -49,6 +60,8 @@ final class FieldExtractor {
         final FormToken form;
         final boolean domId;
         final boolean domAlias;
+        final JsonPath jsonPath;
+        final JsonScalar jsonScalar;
 
         Pair(String key, String value, int objId) {
             this(key, value, objId, Kind.BODY);
@@ -63,6 +76,11 @@ final class FieldExtractor {
         }
 
         Pair(String key, String value, int objId, Kind kind, FormToken form, boolean domId, boolean domAlias) {
+            this(key, value, objId, kind, form, domId, domAlias, null, null);
+        }
+
+        Pair(String key, String value, int objId, Kind kind, FormToken form, boolean domId, boolean domAlias,
+             JsonPath jsonPath, JsonScalar jsonScalar) {
             this.key = key;
             this.value = value;
             this.objId = objId;
@@ -70,6 +88,8 @@ final class FieldExtractor {
             this.form = form;
             this.domId = domId;
             this.domAlias = domAlias;
+            this.jsonPath = jsonPath;
+            this.jsonScalar = jsonScalar;
         }
 
         String wireKey() { return form == null ? key : form.name(); }
@@ -102,7 +122,7 @@ final class FieldExtractor {
         }
         String type = contentType == null ? "" : contentType.toLowerCase(Locale.ROOT);
         boolean structuredJson = startsJson(text);
-        if (structuredJson && fields.json(text, 0)) {
+        if (structuredJson && fields.json(text, 0, Strictness.STRICT, tolerant ? JsonPath.ROOT : null)) {
             return fields.result;
         }
         if (type.startsWith("multipart/") && fields.multipart(text, contentType, 0)) {
@@ -137,6 +157,17 @@ final class FieldExtractor {
 
     private static boolean singleLine(String text) {
         return text.indexOf('\r') < 0 && text.indexOf('\n') < 0;
+    }
+
+    static String jsonString(String text) {
+        if (text.length() < 2 || text.charAt(0) != '"' || text.charAt(text.length() - 1) != '"') return text;
+        try (var reader = new JsonReader(new StringReader(text))) {
+            reader.setStrictness(Strictness.STRICT);
+            String decoded = reader.nextString();
+            return reader.peek() == JsonToken.END_DOCUMENT ? decoded : text;
+        } catch (IllegalStateException | IOException ignored) {
+            return text;
+        }
     }
 
     private static boolean startsJson(String text) {
@@ -218,11 +249,15 @@ final class FieldExtractor {
         }
 
         private boolean json(String text, int nested, Strictness strictness) {
+            return json(text, nested, strictness, null);
+        }
+
+        private boolean json(String text, int nested, Strictness strictness, JsonPath path) {
             if (result.size() >= MAX_FIELDS) return true;
             int initialSize = result.size();
             try (JsonReader reader = new JsonReader(new StringReader(text))) {
                 reader.setStrictness(strictness);
-                visitJson(reader, null, -1, 0, nested);
+                visitJson(reader, null, -1, 0, nested, path);
                 if (reader.peek() == JsonToken.END_DOCUMENT) return true;
             } catch (IllegalStateException | IOException ignored) {
                 // Keep malformed input available through plain-text search.
@@ -231,26 +266,29 @@ final class FieldExtractor {
             return false;
         }
 
-        private void visitJson(JsonReader reader, String key, int id, int depth, int nested) throws IOException {
+        private void visitJson(JsonReader reader, String key, int id, int depth, int nested, JsonPath path)
+                throws IOException {
             if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException();
             if (depth > MAX_DEPTH || result.size() >= MAX_FIELDS) {
                 reader.skipValue();
                 return;
             }
-            switch (reader.peek()) {
+            JsonToken token = reader.peek();
+            switch (token) {
                 case BEGIN_OBJECT -> {
                     int object = ++group;
                     reader.beginObject();
                     while (reader.hasNext()) {
                         String name = reader.nextName();
-                        visitJson(reader, name, object, depth + 1, nested);
+                        visitJson(reader, name, object, depth + 1, nested, path == null ? null : path.child(name));
                     }
                     reader.endObject();
                 }
                 case BEGIN_ARRAY -> {
                     reader.beginArray();
+                    var elementPath = path == null ? null : path.child(null);
                     while (reader.hasNext()) {
-                        visitJson(reader, key, id, depth + 1, nested);
+                        visitJson(reader, key, id, depth + 1, nested, elementPath);
                     }
                     reader.endArray();
                 }
@@ -258,7 +296,15 @@ final class FieldExtractor {
                 case BOOLEAN -> add(key, Boolean.toString(reader.nextBoolean()), id);
                 case STRING, NUMBER -> {
                     String value = reader.nextString();
-                    add(key, value, id);
+                    if (path == null || path.name() == null) {
+                        add(key, value, id);
+                    } else {
+                        boolean integer = DiscoveryValues.decimalInteger(value);
+                        var scalar = token == JsonToken.STRING
+                                ? (integer ? JsonScalar.INTEGER_STRING : JsonScalar.STRING)
+                                : (integer ? JsonScalar.INTEGER : null);
+                        add(new Pair(key, value, id, Kind.BODY, null, false, false, path, scalar));
+                    }
                     if (nested < 2) nestedValue(value, nested + 1);
                 }
                 default -> throw new IOException("Unexpected JSON token");
